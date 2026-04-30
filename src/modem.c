@@ -40,15 +40,15 @@ extern const char g_fw_ver[];
  * USER CONFIG  —  change these two lines per device before flashing
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define PUMP_ID "01"                 /* "01" for pump 1, "02" for pump 2  */
-#define MQTT_USERNAME ""             /* anonymous — broker.emqx.io         */
-#define MQTT_PASSWORD ""
+#define MQTT_USERNAME "pump01"       /* EMQX Cloud credentials             */
+#define MQTT_PASSWORD "Light@2026"
 
 /* ── APN — change to your SIM card ─────────────────────────────────────── */
 /* Airtel: "airtelgprs.com"   Jio: "jionet"   BSNL: "bsnlnet"             */
 #define SIM_APN "airtelgprs.com"
 
 /* ── Broker ─────────────────────────────────────────────────────────────── */
-#define BROKER_HOST "broker.emqx.io"
+#define BROKER_HOST "z9c698f0.ala.asia-southeast1.emqxsl.com"
 #define BROKER_PORT "8883"
 #define CLIENT_ID "pump" PUMP_ID
 
