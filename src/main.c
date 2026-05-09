@@ -27,7 +27,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#define FW_VER "2026-04-24-ota-stable"
+#define FW_VER "2026-05-05"
 const char g_fw_ver[] = FW_VER;
 extern volatile uint32_t g_reset_reason_magic;
 extern volatile uint32_t g_hf_pc;
@@ -373,12 +373,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = Relay1_RST_Pin;
   HAL_GPIO_Init(Relay1_RST_GPIO_Port, &GPIO_InitStruct);
 
-  /* PB5 — pump2 SET coil (transistor driver), idle LOW */
+  /* PB4 — pump2 SET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay2_Pin_GPIO_Port, Relay2_Pin_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay2_Pin_Pin;
   HAL_GPIO_Init(Relay2_Pin_GPIO_Port, &GPIO_InitStruct);
 
-  /* PB0 — pump2 RESET coil (transistor driver), idle LOW */
+  /* PB5 — pump2 RESET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay2_RST_GPIO_Port, Relay2_RST_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay2_RST_Pin;
   HAL_GPIO_Init(Relay2_RST_GPIO_Port, &GPIO_InitStruct);

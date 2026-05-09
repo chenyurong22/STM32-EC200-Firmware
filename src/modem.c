@@ -33,6 +33,7 @@
 
 /* IWDG handle lives in main.c — refresh it inside long blocking delays */
 extern IWDG_HandleTypeDef hiwdg;
+
 extern volatile uint8_t g_boot_phase;
 extern const char g_fw_ver[];
 
@@ -40,15 +41,15 @@ extern const char g_fw_ver[];
  * USER CONFIG  —  change these two lines per device before flashing
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define PUMP_ID "01"                 /* "01" for pump 1, "02" for pump 2  */
-#define MQTT_USERNAME "pump01"       /* EMQX Cloud credentials             */
-#define MQTT_PASSWORD "Light@2026"
+#define MQTT_USERNAME ""             /* anonymous — broker.emqx.io         */
+#define MQTT_PASSWORD ""
 
 /* ── APN — change to your SIM card ─────────────────────────────────────── */
 /* Airtel: "airtelgprs.com"   Jio: "jionet"   BSNL: "bsnlnet"             */
 #define SIM_APN "airtelgprs.com"
 
 /* ── Broker ─────────────────────────────────────────────────────────────── */
-#define BROKER_HOST "z9c698f0.ala.asia-southeast1.emqxsl.com"
+#define BROKER_HOST "broker.emqx.io"
 #define BROKER_PORT "8883"
 #define CLIENT_ID "pump" PUMP_ID
 
@@ -56,21 +57,32 @@ extern const char g_fw_ver[];
 #define TOPIC_STATUS   "pump/" PUMP_ID "/status"
 #define TOPIC_CMD      "pump/" PUMP_ID "/cmd"
 #define TOPIC_ALERTS   "pump/" PUMP_ID "/alerts"
-#define TOPIC_OTA      "pump/" PUMP_ID "/ota"
+#define TOPIC_OTA        "pump/" PUMP_ID "/ota"
+#define TOPIC_OTA_STATUS "pump/" PUMP_ID "/ota/status"
 #define TOPIC_SETTINGS "pump/" PUMP_ID "/settings"
 #define TOPIC_LOG      "pump/" PUMP_ID "/log"
 /* pump02 — same STM32, separate MQTT device (relay2 = PB4/PB5) */
-#define TOPIC_CMD2     "pump/02/cmd"
-#define TOPIC_STATUS2  "pump/02/status"
+#define TOPIC_CMD2       "pump/02/cmd"
+#define TOPIC_STATUS2    "pump/02/status"
+#define TOPIC_ALERTS2    "pump/02/alerts"
+#define TOPIC_LOG2       "pump/02/log"
+#define TOPIC_SETTINGS2  "pump/02/settings"
 
 /* ── Protection thresholds — runtime configurable via TOPIC_SETTINGS ─────── */
 static float cfg_ov    = 480.0f; /* V  — any L-N above this trips relay    */
 static float cfg_uv    = 340.0f; /* V  — any L-N below this trips relay    */
 static float cfg_pl    = 200.0f; /* V  — L-N below this = phase lost       */
-static float cfg_dry_i = 1.5f;   /* A  — below this = dry running          */
+static float cfg_dry_i = 1.5f;   /* A  — below this = dry running (relay1) */
 static int   cfg_dry_t = 8;      /* s  — consecutive seconds before trip   */
 static int   cfg_hp     = 0;     /* pump rating: 5=5HP 75=7.5HP 0=custom   */
-static int   cfg_dry_en = 1;    /* 1=dry-run enabled  0=disabled           */
+static int   cfg_dry_en  = 1;   /* 1=dry-run enabled  0=disabled           */
+static int   cfg_start_t = 300; /* s  — startup grace: skip dry-run count  */
+/* ── Relay2-specific settings (dry_i/dry_t/dry_en/hp only — voltage shared) */
+static float cfg_dry_i2  = 1.5f; /* A  — dry run threshold for relay2      */
+static int   cfg_dry_t2  = 8;    /* s  — dry run delay for relay2          */
+static int   cfg_dry_en2 = 1;    /* 1=dry-run enabled for relay2            */
+static int   cfg_hp2     = 0;    /* relay2 pump rating                       */
+static int   cfg_start_t2 = 300; /* s  — startup grace for relay2           */
 #define LOCKOUT_MS 300000UL       /* 5 min lockout after dry-run trip       */
 
 /* ── Heartbeat interval (event-driven: also publish on every state change) ── */
@@ -121,13 +133,16 @@ static uint32_t relay1_on_tick = 0;  /* HAL_GetTick() when relay1 last turned ON
 static uint32_t relay2_on_tick = 0;  /* HAL_GetTick() when relay2 last turned ON */
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
 static char recv_pending_topic[48] = ""; /* topic of pending split-line payload     */
-static uint8_t dry_run_count = 0;
-static bool dry_run_tripped = false;
-static uint32_t lockout_until = 0;
+static uint8_t  dry_run_count   = 0;
+static bool     dry_run_tripped = false;
+static uint32_t lockout_until   = 0;
+static uint8_t  dry_run_count2  = 0;
+static bool     dry_run_tripped2 = false;
+static uint32_t lockout_until2  = 0;
 
 /* publish queue — one pending payload at a time */
 static char pub_topic[48];
-static char pub_payload[300];
+static char pub_payload[512];
 static bool pub_pending = false;
 
 /* OTA error saved here so it survives MQTT reconnect (heartbeat would overwrite pub_pending) */
@@ -360,32 +375,44 @@ static void publish_status(void)
     fmt_f1(sv3, sizeof(sv3), v3);
     fmt_f2(sci, sizeof(sci), i);
 
-    char scfg_ov[10], scfg_uv[10], scfg_pl[10], scfg_dry_i[10];
+    char scfg_ov[10], scfg_uv[10], scfg_pl[10], scfg_dry_i[10], scfg_dry_i2[10];
     fmt_f1(scfg_ov,    sizeof(scfg_ov),    cfg_ov);
     fmt_f1(scfg_uv,    sizeof(scfg_uv),    cfg_uv);
     fmt_f1(scfg_pl,    sizeof(scfg_pl),    cfg_pl);
     fmt_f2(scfg_dry_i, sizeof(scfg_dry_i), cfg_dry_i);
+    fmt_f2(scfg_dry_i2,sizeof(scfg_dry_i2),cfg_dry_i2);
 
-    char payload[440];
+    bool data_ok   = Modbus_IsDataValid();
+    bool r1_running = relay1 && data_ok && (i > cfg_dry_i);
+    bool r2_running = relay2 && data_ok && (i > cfg_dry_i2); /* relay2 uses its own threshold */
+
+    char payload[640];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
+             "\"relay1_running\":%d,\"relay2_running\":%d,"
              "\"v1\":%s,\"v2\":%s,\"v3\":%s,"
              "\"current\":%s,"
-             "\"dry_run\":%s,\"online\":true,"
+             "\"dry_run\":%s,\"dry_run2\":%s,\"online\":true,"
              "\"mb_ok\":%d,\"mb_rx\":%d,\"rssi\":%d,\"boot_phase\":%u,"
              "\"fw\":\"%s\","
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
-             "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d}",
+             "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
+             "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
+             r1_running ? 1 : 0,
+             r2_running ? 1 : 0,
              sv1, sv2, sv3, sci,
-             dry_run_tripped ? "true" : "false",
-             Modbus_IsDataValid() ? 1 : 0,
+             dry_run_tripped  ? "true" : "false",
+             dry_run_tripped2 ? "true" : "false",
+             data_ok ? 1 : 0,
              (int)Modbus_GetLastRx(),
              (int)last_rssi,
              (unsigned)g_boot_phase,
              g_fw_ver,
-             scfg_ov, scfg_uv, scfg_pl, scfg_dry_i, cfg_dry_t, cfg_hp, cfg_dry_en);
+             scfg_ov, scfg_uv, scfg_pl,
+             scfg_dry_i, cfg_dry_t, cfg_start_t, cfg_hp, cfg_dry_en,
+             scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2);
 
     queue_publish(TOPIC_STATUS, payload);
 }
@@ -414,6 +441,19 @@ static void publish_alert(bool ov, bool uv, bool pl, bool dr)
     queue_publish(TOPIC_ALERTS, payload);
 }
 
+static void publish_alert2(bool ov, bool uv, bool pl, bool dr)
+{
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"overvoltage\":%s,\"undervoltage\":%s,"
+             "\"phase_loss\":%s,\"dry_run_trip\":%s}",
+             ov ? "true" : "false",
+             uv ? "true" : "false",
+             pl ? "true" : "false",
+             dr ? "true" : "false");
+    queue_publish(TOPIC_ALERTS2, payload);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Relay log — publishes on/off events to TOPIC_LOG
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -433,15 +473,28 @@ static void log_relay_event(int relay_num, bool on, const char *reason)
                  "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d}",
                  reason, (unsigned long)run_s, relay_num);
     }
-    queue_publish(TOPIC_LOG, payload);
+    queue_publish((relay_num == 2) ? TOPIC_LOG2 : TOPIC_LOG, payload);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Protection logic  — called every 1 s when connected
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+static bool is_volt_fault(void)
+{
+    float v1 = Sensor_ReadVoltagePhase1();
+    float v2 = Sensor_ReadVoltagePhase2();
+    float v3 = Sensor_ReadVoltagePhase3();
+    return (v1 > cfg_ov || v2 > cfg_ov || v3 > cfg_ov) ||
+           (v1 < cfg_uv || v2 < cfg_uv || v3 < cfg_uv) ||
+           (v1 < cfg_pl || v2 < cfg_pl || v3 < cfg_pl);
+}
+
 static void run_protection(void)
 {
+    static bool prev_r1_running = false;
+    static bool prev_r2_running = false;
+
     float v1 = Sensor_ReadVoltagePhase1();
     float v2 = Sensor_ReadVoltagePhase2();
     float v3 = Sensor_ReadVoltagePhase3();
@@ -451,19 +504,37 @@ static void run_protection(void)
     bool uv = (v1 < cfg_uv || v2 < cfg_uv || v3 < cfg_uv);
     bool pl = (v1 < cfg_pl || v2 < cfg_pl || v3 < cfg_pl);
 
-    /* voltage protection disabled until meter wiring verified
     if ((ov || uv || pl) && relay1)
     {
         Relay1_Set(false);
-        Relay2_Set(true);
         log_relay_event(1, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
         publish_alert(ov, uv, pl, false);
-        Debug_Print("[PROT] Voltage fault — pump OFF\r\n");
-        return;
-    } */
+        Debug_Print("[PROT] Voltage fault — pump1 OFF\r\n");
+    }
 
-    /* dry run detection disabled until current sensor wiring verified
-    if (relay1 && !dry_run_tripped && cfg_dry_en)
+    if ((ov || uv || pl) && relay2)
+    {
+        Relay2_Set(false);
+        log_relay_event(2, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
+        publish_alert2(ov, uv, pl, false);
+        Debug_Print("[PROT] Voltage fault — pump2 OFF\r\n");
+    }
+
+    if ((ov || uv || pl) && (relay1 || relay2))
+        return;
+
+    /* Startup grace: skip dry-run counting for cfg_start_t s after relay1 turns ON.
+     * Prevents false trips while an external soft-starter / star-delta starter
+     * delays the motor current draw by 30-90 s.
+     * relay1_on_tick is set by log_relay_event(1, true, ...) when relay turns ON. */
+    bool relay1_in_startup = relay1_on_tick &&
+        (HAL_GetTick() - relay1_on_tick < (uint32_t)cfg_start_t * 1000U);
+
+    if (relay1_in_startup)
+    {
+        dry_run_count = 0; /* keep counter clear during startup grace */
+    }
+    else if (relay1 && !dry_run_tripped && cfg_dry_en)
     {
         if (i < cfg_dry_i)
         {
@@ -473,7 +544,6 @@ static void run_protection(void)
                 dry_run_tripped = true;
                 lockout_until = HAL_GetTick() + LOCKOUT_MS;
                 Relay1_Set(false);
-                Relay2_Set(true);
                 log_relay_event(1, false, "dry_run");
                 publish_alert(false, false, false, true);
                 Debug_Print("[PROT] Dry run — pump OFF + lockout\r\n");
@@ -489,10 +559,63 @@ static void run_protection(void)
     {
         dry_run_tripped = false;
         dry_run_count = 0;
-        Relay2_Set(false);
         publish_alert(false, false, false, false);
         Debug_Print("[PROT] Lockout cleared\r\n");
-    } */
+    }
+
+    /* ── Relay2 dry run protection ─────────────────────────────────────── */
+    bool relay2_in_startup = relay2_on_tick &&
+        (HAL_GetTick() - relay2_on_tick < (uint32_t)cfg_start_t2 * 1000U);
+
+    if (relay2_in_startup)
+    {
+        dry_run_count2 = 0;
+    }
+    else if (relay2 && !dry_run_tripped2 && cfg_dry_en2)
+    {
+        if (i < cfg_dry_i2)
+        {
+            dry_run_count2++;
+            if (dry_run_count2 >= (uint8_t)cfg_dry_t2)
+            {
+                dry_run_tripped2 = true;
+                lockout_until2 = HAL_GetTick() + LOCKOUT_MS;
+                Relay2_Set(false);
+                log_relay_event(2, false, "dry_run");
+                publish_alert2(false, false, false, true);
+                Debug_Print("[PROT] Dry run2 — pump2 OFF + lockout\r\n");
+            }
+        }
+        else
+        {
+            dry_run_count2 = 0;
+        }
+    }
+
+    if (dry_run_tripped2 && HAL_GetTick() >= lockout_until2)
+    {
+        dry_run_tripped2 = false;
+        dry_run_count2 = 0;
+        publish_alert2(false, false, false, false);
+        Debug_Print("[PROT] Lockout2 cleared\r\n");
+    }
+
+    /* Publish immediately when running state changes (relay ON + current confirmed).
+     * Without this, STARTING→RUNNING transition waits up to 10s for next heartbeat.
+     * run_protection fires every 1s; Modbus updates every 2s — transition seen within 3s. */
+    bool data_ok   = Modbus_IsDataValid();
+    bool r1_running = relay1 && data_ok && (i > cfg_dry_i);
+    bool r2_running = relay2 && data_ok && (i > cfg_dry_i2); /* relay2 uses its own threshold */
+    if (r1_running != prev_r1_running)
+    {
+        prev_r1_running = r1_running;
+        publish_status();
+    }
+    if (r2_running != prev_r2_running)
+    {
+        prev_r2_running = r2_running;
+        publish_status2();
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -601,7 +724,21 @@ static void apply_settings(const char *json)
     t = extract_int(json, "dry_t");              if (t > 0)    cfg_dry_t = t;
     t = extract_int(json, "hp");                 if (t > 0)    cfg_hp     = t;
     if (strstr(json, "\"dry_en\":"))             cfg_dry_en = extract_int(json, "dry_en") ? 1 : 0;
+    t = extract_int(json, "start_t");            if (t > 0)    cfg_start_t = t;
     Debug_Print("[CFG] Settings updated\r\n");
+}
+
+/* Apply relay2-specific settings (dry_i/dry_t/dry_en/hp only — voltage shared) */
+static void apply_settings2(const char *json)
+{
+    float v;
+    int   t;
+    v = extract_float(json, "dry_i", cfg_dry_i2); if (v > 0.0f) cfg_dry_i2 = v;
+    t = extract_int(json, "dry_t");               if (t > 0)    cfg_dry_t2 = t;
+    t = extract_int(json, "hp");                  if (t > 0)    cfg_hp2    = t;
+    if (strstr(json, "\"dry_en\":"))              cfg_dry_en2 = extract_int(json, "dry_en") ? 1 : 0;
+    t = extract_int(json, "start_t");             if (t > 0)    cfg_start_t2 = t;
+    Debug_Print("[CFG] Settings2 updated\r\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -668,6 +805,13 @@ static void process_line(const char *line)
                 recv_pending_topic[0] = '\0';
                 return;
             }
+            if (strstr(recv_pending_topic, TOPIC_SETTINGS2) ||
+                strstr(line, TOPIC_SETTINGS2))
+            {
+                apply_settings2(json);
+                recv_pending_topic[0] = '\0';
+                return;
+            }
             /* pump/02/cmd — relay1 field maps to physical relay2 (PB4/PB5)
              * Check BOTH recv_pending_topic (split-line) AND current line
              * (inline: topic+payload on same AT+QMTRECV response line) */
@@ -681,6 +825,18 @@ static void process_line(const char *line)
                 {
                     char cmd_src[16] = "";
                     extract_str(json, "src", cmd_src, sizeof(cmd_src));
+                    if (r == 1 && relay1) {
+                        Debug_Print("[CMD] Relay2 ON blocked — relay1 active\r\n");
+                        return;
+                    }
+                    if (r == 1 && is_volt_fault()) {
+                        Debug_Print("[CMD] Relay2 ON blocked — voltage fault\r\n");
+                        return;
+                    }
+                    if (r == 1 && HAL_GetTick() < lockout_until2) {
+                        Debug_Print("[CMD] Relay2 ON blocked — lockout active\r\n");
+                        return;
+                    }
                     bool prev2 = relay2;
                     Relay2_Set(r == 1);
                     if (relay2 != prev2) {
@@ -704,16 +860,22 @@ static void process_line(const char *line)
             int r1 = extract_int(json, "relay1");
             if (r1 >= 0)
             {
-                if (r1 == 1 && HAL_GetTick() < lockout_until)
+                if (r1 == 1 && relay2)
+                    Debug_Print("[CMD] Relay1 ON blocked — relay2 active\r\n");
+                else if (r1 == 1 && HAL_GetTick() < lockout_until)
                     Debug_Print("[CMD] Relay1 ON blocked — lockout active\r\n");
+                else if (r1 == 1 && is_volt_fault())
+                    Debug_Print("[CMD] Relay1 ON blocked — voltage fault\r\n");
                 else
                 {
                     char cmd_src[16] = "";
                     extract_str(json, "src", cmd_src, sizeof(cmd_src));
                     bool prev1 = relay1;
                     Relay1_Set(r1 == 1);
-                    if (relay1 != prev1)
+                    if (relay1 != prev1) {
                         log_relay_event(1, relay1, cmd_src[0] ? cmd_src : "manual");
+                        publish_status();
+                    }
                     Debug_Print(r1 ? "[CMD] Relay1 ON\r\n" : "[CMD] Relay1 OFF\r\n");
                 }
             }
@@ -746,6 +908,11 @@ static void process_line(const char *line)
                 apply_settings(json);
                 return;
             }
+            if (strstr(line, TOPIC_SETTINGS2))
+            {
+                apply_settings2(json);
+                return;
+            }
             /* OTA command: {"url":"https://..."} */
             char ota_url[200];
             if (extract_str(json, "url", ota_url, sizeof(ota_url)))
@@ -765,6 +932,18 @@ static void process_line(const char *line)
                 {
                     char cmd_src[16] = "";
                     extract_str(json, "src", cmd_src, sizeof(cmd_src));
+                    if (r == 1 && relay1) {
+                        Debug_Print("[CMD] Relay2 ON blocked — relay1 active\r\n");
+                        return;
+                    }
+                    if (r == 1 && is_volt_fault()) {
+                        Debug_Print("[CMD] Relay2 ON blocked — voltage fault\r\n");
+                        return;
+                    }
+                    if (r == 1 && HAL_GetTick() < lockout_until2) {
+                        Debug_Print("[CMD] Relay2 ON blocked — lockout active\r\n");
+                        return;
+                    }
                     bool prev2 = relay2;
                     Relay2_Set(r == 1);
                     if (relay2 != prev2) {
@@ -778,16 +957,22 @@ static void process_line(const char *line)
                 int r1 = extract_int(json, "relay1");
                 if (r1 >= 0)
                 {
-                    if (r1 == 1 && HAL_GetTick() < lockout_until)
+                    if (r1 == 1 && relay2)
+                        Debug_Print("[CMD] Relay1 ON blocked — relay2 active\r\n");
+                    else if (r1 == 1 && HAL_GetTick() < lockout_until)
                         Debug_Print("[CMD] Relay1 ON blocked — lockout active\r\n");
+                    else if (r1 == 1 && is_volt_fault())
+                        Debug_Print("[CMD] Relay1 ON blocked — voltage fault\r\n");
                     else
                     {
                         char cmd_src[16] = "";
                         extract_str(json, "src", cmd_src, sizeof(cmd_src));
                         bool prev1 = relay1;
                         Relay1_Set(r1 == 1);
-                        if (relay1 != prev1)
+                        if (relay1 != prev1) {
                             log_relay_event(1, relay1, cmd_src[0] ? cmd_src : "manual");
+                            publish_status();
+                        }
                         Debug_Print(r1 ? "[CMD] Relay1 ON\r\n" : "[CMD] Relay1 OFF\r\n");
                     }
                 }
@@ -1134,8 +1319,16 @@ static void process_line(const char *line)
         }
         if (strstr(line, "+QMTSUB: 0,4,0"))
         {
-            /* pump02/cmd subscribed — fully connected now */
-            Debug_Print("[MQTT] Subscribed to " TOPIC_CMD2 "\r\n");
+            /* pump02/cmd subscribed — now subscribe to pump02/settings */
+            Debug_Print("[MQTT] Subscribed to " TOPIC_CMD2 " — subscribing settings2...\r\n");
+            char sub_cmd[64];
+            snprintf(sub_cmd, sizeof(sub_cmd), "AT+QMTSUB=0,5,\"%s\",1", TOPIC_SETTINGS2);
+            modem_cmd(sub_cmd);
+        }
+        if (strstr(line, "+QMTSUB: 0,5,0"))
+        {
+            /* pump02/settings subscribed — fully connected now */
+            Debug_Print("[MQTT] Subscribed to " TOPIC_SETTINGS2 "\r\n");
             blink_n(3); /* 3 blinks = MQTT fully connected! */
             HAL_IWDG_Refresh(&hiwdg);
 
@@ -1305,7 +1498,7 @@ static void modem_ota_start(const char *url)
     /* Central cooldown guard: block OTA retrigger after modem reboot during OTA. */
     if (ota_retry_blocked()) {
         Debug_Print("[OTA] Trigger ignored (cooldown active)\r\n");
-        queue_publish("pump/01/ota/status",
+        queue_publish(TOPIC_OTA_STATUS,
                       "{\"ota_status\":\"error\",\"reason\":\"ota cooldown active\"}");
         return;
     }
@@ -1345,7 +1538,7 @@ static void modem_ota_start(const char *url)
         const char *ota_payload = "{\"ota_status\":\"starting\"}";
         char pub_cmd[80];
         snprintf(pub_cmd, sizeof(pub_cmd),
-                 "AT+QMTPUBEX=0,0,0,0,\"pump/01/ota/status\",%d",
+                 "AT+QMTPUBEX=0,0,0,0,\"" TOPIC_OTA_STATUS "\",%d",
                  (int)strlen(ota_payload));
         modem_cmd(pub_cmd);
         uint8_t c;
@@ -1445,7 +1638,7 @@ static void modem_ota_start(const char *url)
         snprintf(errbuf, sizeof(errbuf),
                  "{\"ota_status\":\"error\",\"reason\":\"no CONNECT: %s\"}", modem_last_resp);
         pub_pending = false;
-        queue_publish("pump/01/ota/status", errbuf);
+        queue_publish(TOPIC_OTA_STATUS, errbuf);
         return;   /* MQTT still connected — normal operation resumes         */
     }
 
@@ -1458,7 +1651,7 @@ static void modem_ota_start(const char *url)
         snprintf(errbuf, sizeof(errbuf),
                  "{\"ota_status\":\"error\",\"reason\":\"URL rejected: %s\"}", modem_last_resp);
         pub_pending = false;
-        queue_publish("pump/01/ota/status", errbuf);
+        queue_publish(TOPIC_OTA_STATUS, errbuf);
         return;   /* MQTT still connected                                    */
     }
     HAL_IWDG_Refresh(&hiwdg);
@@ -1541,13 +1734,13 @@ static void modem_ota_start(const char *url)
         snprintf(urlcmd2, sizeof(urlcmd2), "AT+QHTTPURL=%d,5", (int)strlen(url));
         modem_cmd(urlcmd2);
         if (!modem_sync_expect("CONNECT", 10000)) {
-            queue_publish("pump/01/ota/status",
+            queue_publish(TOPIC_OTA_STATUS,
                           "{\"ota_status\":\"error\",\"reason\":\"no CONNECT (post-cfun)\"}");
             return;
         }
         Modem_Send(url);
         if (!modem_sync_expect("OK", 10000)) {
-            queue_publish("pump/01/ota/status",
+            queue_publish(TOPIC_OTA_STATUS,
                           "{\"ota_status\":\"error\",\"reason\":\"URL reject (post-cfun)\"}");
             return;
         }
@@ -1563,7 +1756,7 @@ static void modem_ota_start(const char *url)
 /* ── OTA publish callback — lets ota.c publish via MQTT ─────────────────── */
 static void modem_ota_publish(const char *topic, const char *payload)
 {
-    (void)topic;  /* topic always pump/01/ota/status — matches ota_error_msg path */
+    (void)topic;  /* topic always TOPIC_OTA_STATUS — matches ota_error_msg path */
 
     /* Only save meaningful OTA status updates to ota_error_msg so they
      * survive MQTT disconnect+reconnect.  Skip ota_debug trace lines —
@@ -1580,7 +1773,7 @@ static void modem_ota_publish(const char *topic, const char *payload)
     }
 
     pub_pending = false;
-    queue_publish("pump/01/ota/status", payload);
+    queue_publish(TOPIC_OTA_STATUS, payload);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1954,6 +2147,7 @@ void Modem_Process(void)
             last_heartbeat_ms = HAL_GetTick();
             modem_cmd("AT+CSQ"); /* refresh signal strength; +CSQ updates last_rssi */
             publish_status();
+            publish_status2();
         }
 
         /* run protection every 1 s */
@@ -1969,7 +2163,7 @@ void Modem_Process(void)
     if (ota_error_msg[0] && mqtt_state == MQTT_STATE_CONNECTED)
     {
         pub_pending = false; /* prioritize OTA result over queued heartbeat */
-        queue_publish("pump/01/ota/status", ota_error_msg);
+        queue_publish(TOPIC_OTA_STATUS, ota_error_msg);
         ota_error_msg[0] = '\0';
         force_status_after_ota = true;
     }
