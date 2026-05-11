@@ -515,7 +515,19 @@ static void run_protection(void)
     bool uv = (v1 < cfg_uv || v2 < cfg_uv || v3 < cfg_uv);
     bool pl = (v1 < cfg_pl || v2 < cfg_pl || v3 < cfg_pl);
 
-    if ((ov || uv || pl) && relay1)
+    /* Startup grace windows — computed once, reused for both voltage and dry-run suppression.
+     * During the grace window UV+PL are ignored: motor inrush can briefly dip the supply.
+     * OV protection stays active at all times (overvoltage during startup is dangerous). */
+    bool relay1_in_startup = relay1_on_tick &&
+        (HAL_GetTick() - relay1_on_tick < (uint32_t)cfg_start_t * 1000U);
+    bool relay2_in_startup = relay2_on_tick &&
+        (HAL_GetTick() - relay2_on_tick < (uint32_t)cfg_start_t2 * 1000U);
+
+    /* OV always trips.  UV+PL only trip once the startup grace window has expired. */
+    bool volt_trip1 = ov || (!relay1_in_startup && (uv || pl));
+    bool volt_trip2 = ov || (!relay2_in_startup && (uv || pl));
+
+    if (volt_trip1 && relay1)
     {
         Relay1_Set(false);
         log_relay_event(1, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
@@ -524,7 +536,7 @@ static void run_protection(void)
         Debug_Print("[PROT] Voltage fault — pump1 OFF\r\n");
     }
 
-    if ((ov || uv || pl) && relay2)
+    if (volt_trip2 && relay2)
     {
         Relay2_Set(false);
         log_relay_event(2, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
@@ -551,13 +563,7 @@ static void run_protection(void)
         }
     }
 
-    /* Startup grace: skip dry-run counting for cfg_start_t s after relay1 turns ON.
-     * Prevents false trips while an external soft-starter / star-delta starter
-     * delays the motor current draw by 30-90 s.
-     * relay1_on_tick is set by log_relay_event(1, true, ...) when relay turns ON. */
-    bool relay1_in_startup = relay1_on_tick &&
-        (HAL_GetTick() - relay1_on_tick < (uint32_t)cfg_start_t * 1000U);
-
+    /* relay1_in_startup already computed above (shared grace window for voltage + dry-run) */
     if (relay1_in_startup)
     {
         dry_run_count = 0; /* keep counter clear during startup grace */
@@ -592,9 +598,7 @@ static void run_protection(void)
     }
 
     /* ── Relay2 dry run protection ─────────────────────────────────────── */
-    bool relay2_in_startup = relay2_on_tick &&
-        (HAL_GetTick() - relay2_on_tick < (uint32_t)cfg_start_t2 * 1000U);
-
+    /* relay2_in_startup already computed above (shared grace window for voltage + dry-run) */
     if (relay2_in_startup)
     {
         dry_run_count2 = 0;
