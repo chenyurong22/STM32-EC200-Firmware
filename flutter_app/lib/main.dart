@@ -86,7 +86,7 @@ class _PumpDashboardState extends State<PumpDashboard> {
   final db = FirebaseDatabase.instance;
 
   late final List<SiteConfig> _sites;
-  final Map<String, bool> _pumpOn = {};
+  final Map<String, bool?> _pumpOn = {};
 
   @override
   void initState() {
@@ -96,7 +96,6 @@ class _PumpDashboardState extends State<PumpDashboard> {
       for (var i = 0; i < site.pumpIds.length; i++) {
         final pumpId   = site.pumpIds[i];
         final relayNum = i + 1; // relay1 for index 0, relay2 for index 1
-        _pumpOn[pumpId] = false;
         // Status is published by the physical device (site.deviceId), not per logical pump
         db.ref('pumps/${site.deviceId}/status/relay${relayNum}_state').onValue.listen((event) {
           if (mounted) setState(() => _pumpOn[pumpId] = (event.snapshot.value ?? 0) == 1);
@@ -168,7 +167,7 @@ class _PumpDashboardState extends State<PumpDashboard> {
 // ─── Site section — groups PowerMeter + Pumps + Rotation for one site ─────────
 class _SiteSection extends StatelessWidget {
   final SiteConfig site;
-  final Map<String, bool> pumpOn;
+  final Map<String, bool?> pumpOn;
   final Future<void> Function(String pumpId, bool on) onPumpToggle;
   final bool showHeader;
 
@@ -436,7 +435,7 @@ class _PumpCardState extends State<PumpCard> {
   final db = FirebaseDatabase.instance;
 
   Map<String, dynamic> _alerts = {};
-  bool _relay1Cmd = false;
+  bool? _relay1Cmd;   // null = waiting for Firebase data
   bool _isRunning = false;
 
   // Schedule state
@@ -572,6 +571,20 @@ class _PumpCardState extends State<PumpCard> {
     final bool alertDR  = _alerts['dry_run_trip'] ?? false;
     final bool anyAlert = alertOV || alertUV || alertPL || alertDR;
 
+    // Resolve nullable relay state: null = waiting for Firebase data
+    final bool loading  = _relay1Cmd == null;
+    final bool relayOn  = _relay1Cmd == true;
+    final Color stateColor = loading
+        ? Colors.grey
+        : relayOn
+            ? (_isRunning ? Colors.green : Colors.orange)
+            : Colors.red;
+    final String stateText = loading
+        ? '---'
+        : relayOn
+            ? (_isRunning ? 'RUNNING' : 'STARTING...')
+            : 'STOPPED';
+
     return Card(
       elevation: 2,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -596,46 +609,22 @@ class _PumpCardState extends State<PumpCard> {
                     padding: const EdgeInsets.all(20),
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      color: (!_relay1Cmd
-                              ? Colors.red
-                              : _isRunning
-                                  ? Colors.green
-                                  : Colors.orange)
-                          .withValues(alpha: 0.1),
-                      border: Border.all(
-                        color: !_relay1Cmd
-                            ? Colors.red
-                            : _isRunning
-                                ? Colors.green
-                                : Colors.orange,
-                        width: 2.5,
-                      ),
+                      color: stateColor.withValues(alpha: 0.1),
+                      border: Border.all(color: stateColor, width: 2.5),
                     ),
                     child: Icon(
-                      _relay1Cmd ? Icons.water_drop : Icons.water_drop_outlined,
+                      relayOn ? Icons.water_drop : Icons.water_drop_outlined,
                       size: 52,
-                      color: !_relay1Cmd
-                          ? Colors.red
-                          : _isRunning
-                              ? Colors.green
-                              : Colors.orange,
+                      color: stateColor,
                     ),
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    !_relay1Cmd
-                        ? 'STOPPED'
-                        : _isRunning
-                            ? 'RUNNING'
-                            : 'STARTING...',
+                    stateText,
                     style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.bold,
-                      color: !_relay1Cmd
-                          ? Colors.red
-                          : _isRunning
-                              ? Colors.green
-                              : Colors.orange,
+                      color: stateColor,
                       letterSpacing: 1,
                     ),
                   ),
@@ -675,15 +664,15 @@ class _PumpCardState extends State<PumpCard> {
               width: double.infinity,
               child: _RelayButton(
                 label: 'Pump',
-                isOn: _relay1Cmd,
-                disabled: widget.otherPumpOn && !_relay1Cmd,
+                isOn: relayOn,
+                disabled: loading || (widget.otherPumpOn && !relayOn),
                 onToggle: (val) {
                   setState(() => _relay1Cmd = val);
                   widget.onPumpToggle(val);
                 },
               ),
             ),
-            if (widget.otherPumpOn && !_relay1Cmd) ...[
+            if (widget.otherPumpOn && !relayOn && !loading) ...[
               const SizedBox(height: 6),
               Row(
                 children: [

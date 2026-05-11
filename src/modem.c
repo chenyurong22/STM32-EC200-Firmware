@@ -454,6 +454,8 @@ static void publish_alert2(bool ov, bool uv, bool pl, bool dr)
     queue_publish(TOPIC_ALERTS2, payload);
 }
 
+static void RelayState_Save(void); /* forward declaration */
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Relay log — publishes on/off events to TOPIC_LOG
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -474,6 +476,7 @@ static void log_relay_event(int relay_num, bool on, const char *reason)
                  reason, (unsigned long)run_s, relay_num);
     }
     queue_publish((relay_num == 2) ? TOPIC_LOG2 : TOPIC_LOG, payload);
+    RelayState_Save();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -711,6 +714,57 @@ static bool extract_ota_url_any(const char *text, char *out, size_t max)
 static void modem_ota_start(const char *url); /* forward declaration */
 static void modem_ota_publish(const char *topic, const char *payload); /* forward declaration */
 static bool modem_is_exact_reboot_urc(const char *line);
+
+/* ── Relay state persistence (Flash page 31 = 0x0800F800, 2KB) ──────────────
+ * Saves relay1/relay2 ON/OFF state so a power-cycle reboot restores the
+ * physical latching-relay position correctly instead of defaulting to OFF. */
+#define RELAY_STATE_MAGIC  0xFEED5A5AU
+#define RELAY_STATE_ADDR   0x0800F800U
+#define RELAY_STATE_PAGE   31U
+
+typedef struct {
+    uint32_t magic;
+    uint32_t relay1;   /* 1 = ON, 0 = OFF */
+    uint32_t relay2;
+    uint32_t _pad;     /* 16 bytes total — 2 doublewords */
+} RelayState_t;
+
+static void RelayState_Save(void)
+{
+    RelayState_t s;
+    s.magic  = RELAY_STATE_MAGIC;
+    s.relay1 = relay1 ? 1U : 0U;
+    s.relay2 = relay2 ? 1U : 0U;
+    s._pad   = 0U;
+
+    HAL_FLASH_Unlock();
+    FLASH_EraseInitTypeDef erase = {
+        .TypeErase = FLASH_TYPEERASE_PAGES,
+        .Page      = RELAY_STATE_PAGE,
+        .NbPages   = 1,
+    };
+    uint32_t page_err = 0;
+    HAL_FLASHEx_Erase(&erase, &page_err);
+
+    uint64_t buf[2];
+    memcpy(buf, &s, sizeof(s));
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR,       buf[0]);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR + 8U,  buf[1]);
+    HAL_FLASH_Lock();
+    Debug_Print("[CFG] Relay state saved to Flash\r\n");
+}
+
+static void RelayState_Load(void)
+{
+    const RelayState_t *p = (const RelayState_t *)RELAY_STATE_ADDR;
+    if (p->magic != RELAY_STATE_MAGIC) {
+        Debug_Print("[CFG] No saved relay state — defaulting OFF\r\n");
+        return;
+    }
+    if (p->relay1) Relay1_Set(true);
+    if (p->relay2) Relay2_Set(true);
+    Debug_Print("[CFG] Relay state restored from Flash\r\n");
+}
 
 /* Apply protection settings from JSON payload */
 static void apply_settings(const char *json)
@@ -1786,6 +1840,10 @@ void Modem_Init(UART_HandleTypeDef *huart)
     rxpos = 0;
     mqtt_state = MQTT_STATE_BOOT;
     state_entered_ms = HAL_GetTick();
+
+    /* Restore relay state from Flash before anything else — ensures latching
+     * relays are driven to match their last known position on every reboot. */
+    RelayState_Load();
 
     Debug_Print("\r\n=== EC200U MQTT Pump Controller ===\r\n");
     Debug_Print("[MODEM] Pump ID : " PUMP_ID "\r\n");
