@@ -133,6 +133,8 @@ static uint32_t relay1_on_tick = 0;      /* HAL_GetTick() when relay1 last turne
 static uint32_t relay2_on_tick = 0;      /* HAL_GetTick() when relay2 last turned ON */
 static uint32_t running1_start_tick = 0; /* tick when relay1 current first exceeded threshold */
 static uint32_t running2_start_tick = 0; /* tick when relay2 current first exceeded threshold */
+static bool volt_alert_sent1 = false;    /* voltage fault alert was published for relay1 */
+static bool volt_alert_sent2 = false;    /* voltage fault alert was published for relay2 */
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
 static char recv_pending_topic[48] = ""; /* topic of pending split-line payload     */
 static uint8_t  dry_run_count   = 0;
@@ -518,6 +520,7 @@ static void run_protection(void)
         Relay1_Set(false);
         log_relay_event(1, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
         publish_alert(ov, uv, pl, false);
+        volt_alert_sent1 = true;
         Debug_Print("[PROT] Voltage fault — pump1 OFF\r\n");
     }
 
@@ -526,11 +529,27 @@ static void run_protection(void)
         Relay2_Set(false);
         log_relay_event(2, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
         publish_alert2(ov, uv, pl, false);
+        volt_alert_sent2 = true;
         Debug_Print("[PROT] Voltage fault — pump2 OFF\r\n");
     }
 
     if ((ov || uv || pl) && (relay1 || relay2))
         return;
+
+    /* Voltage OK — clear any outstanding voltage fault alert in Firebase */
+    if (!ov && !uv && !pl)
+    {
+        if (volt_alert_sent1) {
+            volt_alert_sent1 = false;
+            publish_alert(false, false, false, false);
+            Debug_Print("[PROT] Voltage fault cleared — pump1 alert reset\r\n");
+        }
+        if (volt_alert_sent2) {
+            volt_alert_sent2 = false;
+            publish_alert2(false, false, false, false);
+            Debug_Print("[PROT] Voltage fault cleared — pump2 alert reset\r\n");
+        }
+    }
 
     /* Startup grace: skip dry-run counting for cfg_start_t s after relay1 turns ON.
      * Prevents false trips while an external soft-starter / star-delta starter
