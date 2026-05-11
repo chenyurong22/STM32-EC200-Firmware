@@ -129,8 +129,10 @@ static uint32_t state_entered_ms = 0;
 /* relay + protection */
 static bool     relay1 = false;
 static bool     relay2 = false;
-static uint32_t relay1_on_tick = 0;  /* HAL_GetTick() when relay1 last turned ON */
-static uint32_t relay2_on_tick = 0;  /* HAL_GetTick() when relay2 last turned ON */
+static uint32_t relay1_on_tick = 0;      /* HAL_GetTick() when relay1 last turned ON */
+static uint32_t relay2_on_tick = 0;      /* HAL_GetTick() when relay2 last turned ON */
+static uint32_t running1_start_tick = 0; /* tick when relay1 current first exceeded threshold */
+static uint32_t running2_start_tick = 0; /* tick when relay2 current first exceeded threshold */
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
 static char recv_pending_topic[48] = ""; /* topic of pending split-line payload     */
 static uint8_t  dry_run_count   = 0;
@@ -463,14 +465,18 @@ static void RelayState_Save(void); /* forward declaration */
 static void log_relay_event(int relay_num, bool on, const char *reason)
 {
     char payload[96];
-    uint32_t *on_tick = (relay_num == 2) ? &relay2_on_tick : &relay1_on_tick;
+    uint32_t *on_tick   = (relay_num == 2) ? &relay2_on_tick      : &relay1_on_tick;
+    uint32_t *run_tick  = (relay_num == 2) ? &running2_start_tick  : &running1_start_tick;
     if (on) {
-        *on_tick = HAL_GetTick();
+        *on_tick  = HAL_GetTick();
+        *run_tick = 0;  /* reset — set later when current first exceeds threshold */
         snprintf(payload, sizeof(payload),
                  "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d}", reason, relay_num);
     } else {
-        uint32_t run_s = *on_tick ? (HAL_GetTick() - *on_tick) / 1000 : 0;
-        *on_tick = 0;
+        /* run_s = time from first current detection to OFF, not relay-ON to OFF */
+        uint32_t run_s = *run_tick ? (HAL_GetTick() - *run_tick) / 1000 : 0;
+        *on_tick  = 0;
+        *run_tick = 0;
         snprintf(payload, sizeof(payload),
                  "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d}",
                  reason, (unsigned long)run_s, relay_num);
@@ -609,6 +615,12 @@ static void run_protection(void)
     bool data_ok   = Modbus_IsDataValid();
     bool r1_running = relay1 && data_ok && (i > cfg_dry_i);
     bool r2_running = relay2 && data_ok && (i > cfg_dry_i2); /* relay2 uses its own threshold */
+
+    /* Capture the first moment current is detected — used for accurate run_s in logs.
+     * run_s = time from here to relay OFF, excluding soft-starter delay. */
+    if (r1_running && !running1_start_tick) running1_start_tick = HAL_GetTick();
+    if (r2_running && !running2_start_tick) running2_start_tick = HAL_GetTick();
+
     if (r1_running != prev_r1_running)
     {
         prev_r1_running = r1_running;
