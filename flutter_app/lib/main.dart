@@ -7,7 +7,35 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'auth_screen.dart';
+
+// ─── FCM background handler (must be top-level) ───────────────────────────────
+@pragma('vm:entry-point')
+Future<void> _fcmBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(
+    options: const FirebaseOptions(
+      apiKey:            "AIzaSyAKRv98QPE4FraRgGypvdvJfCG0RQs97O0",
+      appId:             "1:22800348697:android:89f6c77fdb6492a797dc88",
+      messagingSenderId: "22800348697",
+      projectId:         "pump-controller-4398d",
+      databaseURL:       "https://pump-controller-4398d-default-rtdb.firebaseio.com",
+    ),
+  );
+  // Background messages are shown automatically by FCM on Android.
+}
+
+// ─── Local notifications plugin instance ─────────────────────────────────────
+final FlutterLocalNotificationsPlugin _localNotifications =
+    FlutterLocalNotificationsPlugin();
+
+const AndroidNotificationChannel _alertChannel = AndroidNotificationChannel(
+  'pump_alerts',
+  'Pump Alerts',
+  description: 'Protection trips, relay events, and device status',
+  importance: Importance.high,
+);
 
 // ─── Site configuration ───────────────────────────────────────────────────────
 class SiteConfig {
@@ -54,6 +82,22 @@ void main() async {
       databaseURL:       "https://pump-controller-4398d-default-rtdb.firebaseio.com",
     ),
   );
+
+  // Register FCM background handler before app starts
+  FirebaseMessaging.onBackgroundMessage(_fcmBackgroundHandler);
+
+  // Create the Android notification channel for local (foreground) notifications
+  await _localNotifications
+      .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(_alertChannel);
+
+  await _localNotifications.initialize(
+    const InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    ),
+  );
+
   runApp(const PumpApp());
 }
 
@@ -95,13 +139,48 @@ class _PumpDashboardState extends State<PumpDashboard> {
     for (final site in _sites) {
       for (var i = 0; i < site.pumpIds.length; i++) {
         final pumpId   = site.pumpIds[i];
-        final relayNum = i + 1; // relay1 for index 0, relay2 for index 1
-        // Status is published by the physical device (site.deviceId), not per logical pump
+        final relayNum = i + 1;
         db.ref('pumps/${site.deviceId}/status/relay${relayNum}_state').onValue.listen((event) {
           if (mounted) setState(() => _pumpOn[pumpId] = (event.snapshot.value ?? 0) == 1);
         });
       }
     }
+    _initFCM();
+  }
+
+  Future<void> _initFCM() async {
+    final messaging = FirebaseMessaging.instance;
+
+    // Request permission (Android 13+ / iOS)
+    await messaging.requestPermission(alert: true, badge: true, sound: true);
+
+    // Subscribe to a topic per pump so bridge.js can target by pump
+    for (final site in _sites) {
+      for (final pumpId in site.pumpIds) {
+        await messaging.subscribeToTopic(pumpId); // e.g. "pump01", "pump02"
+      }
+    }
+
+    // Show notification when app is in foreground
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      final n = message.notification;
+      if (n == null) return;
+      _localNotifications.show(
+        message.hashCode,
+        n.title,
+        n.body,
+        NotificationDetails(
+          android: AndroidNotificationDetails(
+            _alertChannel.id,
+            _alertChannel.name,
+            channelDescription: _alertChannel.description,
+            importance: Importance.high,
+            priority: Priority.high,
+            icon: '@mipmap/ic_launcher',
+          ),
+        ),
+      );
+    });
   }
 
   Future<void> _handlePumpToggle(String pumpId, bool turnOn) async {

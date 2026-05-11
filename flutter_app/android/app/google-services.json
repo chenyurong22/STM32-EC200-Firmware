@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "22800348697",
+    "firebase_url": "https://pump-controller-4398d-default-rtdb.firebaseio.com",
+    "project_id": "pump-controller-4398d",
+    "storage_bucket": "pump-controller-4398d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:22800348697:android:89f6c77fdb6492a797dc88",
+        "android_client_info": {
+          "package_name": "com.example.pump_controller"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAKRv98QPE4FraRgGypvdvJfCG0RQs97O0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
