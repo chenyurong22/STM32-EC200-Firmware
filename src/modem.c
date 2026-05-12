@@ -152,6 +152,11 @@ static bool pub_pending = false;
 /* OTA error saved here so it survives MQTT reconnect (heartbeat would overwrite pub_pending) */
 static char ota_error_msg[80];
 static bool force_status_after_ota = false;
+/* Deferred pump02 status publish — set true whenever status2 needs sending;
+ * processed in the main loop as soon as pub_pending clears.
+ * Avoids the drop caused by publish_status() setting pub_pending immediately
+ * before publish_status2() is called. */
+static bool pub_status2_needed = false;
 
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
@@ -1438,7 +1443,7 @@ static void process_line(const char *line)
             last_heartbeat_ms = HAL_GetTick();
             modem_cmd("AT+CSQ"); /* seed rssi before first publish */
             publish_status();
-            publish_status2();
+            pub_status2_needed = true; /* deferred — queue busy after publish_status() */
         }
         break;
 
@@ -2221,6 +2226,13 @@ void Modem_Process(void)
     if (mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive())
     {
 
+        /* Deferred pump02 status — send as soon as the queue is free */
+        if (pub_status2_needed && !pub_pending)
+        {
+            pub_status2_needed = false;
+            publish_status2();
+        }
+
         /* publish on state change — relay or dry-run trip changed */
         if (!pub_pending &&
             (relay1 != prev_relay1 || relay2 != prev_relay2 ||
@@ -2231,7 +2243,7 @@ void Modem_Process(void)
             prev_relay2       = relay2;
             prev_dry_run_trip = dry_run_tripped;
             publish_status();
-            if (relay2_changed) publish_status2();
+            if (relay2_changed) pub_status2_needed = true; /* deferred — queue busy */
         }
 
         /* heartbeat every 60 s — keeps Firebase online:true fresh */
@@ -2240,7 +2252,7 @@ void Modem_Process(void)
             last_heartbeat_ms = HAL_GetTick();
             modem_cmd("AT+CSQ"); /* refresh signal strength; +CSQ updates last_rssi */
             publish_status();
-            publish_status2();
+            pub_status2_needed = true; /* deferred — queue busy after publish_status() */
         }
 
         /* run protection every 1 s */
