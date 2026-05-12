@@ -40,7 +40,8 @@ extern const char g_fw_ver[];
 /* ═══════════════════════════════════════════════════════════════════════════
  * USER CONFIG  —  change these two lines per device before flashing
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define PUMP_ID "01"                 /* "01" for pump 1, "02" for pump 2  */
+#define PUMP_ID  "01"                /* relay1 ID  — "01" prod, "03" test  */
+#define PUMP_ID2 "02"                /* relay2 ID  — always PUMP_ID + 1    */
 #define MQTT_USERNAME ""             /* anonymous — broker.emqx.io         */
 #define MQTT_PASSWORD ""
 
@@ -61,12 +62,12 @@ extern const char g_fw_ver[];
 #define TOPIC_OTA_STATUS "pump/" PUMP_ID "/ota/status"
 #define TOPIC_SETTINGS "pump/" PUMP_ID "/settings"
 #define TOPIC_LOG      "pump/" PUMP_ID "/log"
-/* pump02 — same STM32, separate MQTT device (relay2 = PB4/PB5) */
-#define TOPIC_CMD2       "pump/02/cmd"
-#define TOPIC_STATUS2    "pump/02/status"
-#define TOPIC_ALERTS2    "pump/02/alerts"
-#define TOPIC_LOG2       "pump/02/log"
-#define TOPIC_SETTINGS2  "pump/02/settings"
+/* relay2 — same STM32, topics derived from PUMP_ID2 */
+#define TOPIC_CMD2       "pump/" PUMP_ID2 "/cmd"
+#define TOPIC_STATUS2    "pump/" PUMP_ID2 "/status"
+#define TOPIC_ALERTS2    "pump/" PUMP_ID2 "/alerts"
+#define TOPIC_LOG2       "pump/" PUMP_ID2 "/log"
+#define TOPIC_SETTINGS2  "pump/" PUMP_ID2 "/settings"
 
 /* ── Protection thresholds — runtime configurable via TOPIC_SETTINGS ─────── */
 static float cfg_ov    = 480.0f; /* V  — any L-N above this trips relay    */
