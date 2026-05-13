@@ -803,7 +803,7 @@ static void RelayState_Load(void)
         return;
     }
     if (p->relay1) Relay1_Set(true);
-    if (p->relay2) Relay2_Set(true);
+    if (p->relay2 && !relay1) Relay2_Set(true); /* interlock: never restore both simultaneously */
     Debug_Print("[CFG] Relay state restored from Flash\r\n");
 }
 
