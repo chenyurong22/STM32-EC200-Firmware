@@ -85,6 +85,11 @@ static int   cfg_dry_en2 = 1;    /* 1=dry-run enabled for relay2            */
 static int   cfg_hp2     = 0;    /* relay2 pump rating                       */
 static int   cfg_start_t2 = 300; /* s  — startup grace for relay2           */
 #define LOCKOUT_MS 300000UL       /* 5 min lockout after dry-run trip       */
+/* Minimum current to consider the motor actually running.
+ * If i < this threshold the motor is completely de-energised (external
+ * preventer/timer has opened the contactor) — not a dry-run condition.
+ * Dry-run only counts when the motor IS spinning but drawing low current. */
+#define DRY_RUN_MIN_I_A  0.3f
 
 /* ── Heartbeat interval (event-driven: also publish on every state change) ── */
 #define HEARTBEAT_INTERVAL_MS 10000UL   /* publish status every 10 s */
@@ -576,7 +581,9 @@ static void run_protection(void)
     }
     else if (relay1 && !dry_run_tripped && cfg_dry_en)
     {
-        if (i < cfg_dry_i)
+        /* i >= DRY_RUN_MIN_I_A: motor is running but drawing low current → dry run.
+         * i <  DRY_RUN_MIN_I_A: motor de-energised by external preventer/timer → ignore. */
+        if (i >= DRY_RUN_MIN_I_A && i < cfg_dry_i)
         {
             dry_run_count++;
             if (dry_run_count >= (uint8_t)cfg_dry_t)
@@ -611,7 +618,7 @@ static void run_protection(void)
     }
     else if (relay2 && !dry_run_tripped2 && cfg_dry_en2)
     {
-        if (i < cfg_dry_i2)
+        if (i >= DRY_RUN_MIN_I_A && i < cfg_dry_i2)
         {
             dry_run_count2++;
             if (dry_run_count2 >= (uint8_t)cfg_dry_t2)
@@ -800,10 +807,32 @@ static void RelayState_Load(void)
     const RelayState_t *p = (const RelayState_t *)RELAY_STATE_ADDR;
     if (p->magic != RELAY_STATE_MAGIC) {
         Debug_Print("[CFG] No saved relay state — defaulting OFF\r\n");
+        /* Bistable relays hold position through power-loss.
+         * Explicitly reset both so contacts match the expected default. */
+        Relay1_Set(false);
+        Relay2_Set(false);
         return;
     }
-    if (p->relay1) Relay1_Set(true);
-    if (p->relay2 && !relay1) Relay2_Set(true); /* interlock: never restore both simultaneously */
+    bool r1 = p->relay1 ? true : false;
+    bool r2 = (p->relay2 && !r1) ? true : false;  /* interlock: relay2 OFF if relay1 ON */
+
+    /* Step 1: RESET both relays to a known OFF state first.
+     * Bistable relays hold their mechanical position through power-loss so
+     * the physical state on boot is unknown.  Resetting both guarantees a
+     * clean starting point before re-applying the saved state. */
+    Relay1_Set(false);
+    Relay2_Set(false);
+
+    /* Step 2: wait 500 ms before re-energising.
+     * On a watchdog/software reboot the motor contactor may still be closed
+     * and the motor shaft still spinning.  The delay allows the contactor
+     * to fully open and the motor to coast down before the SET pulse is
+     * sent, avoiding inrush current and mechanical stress on re-close. */
+    HAL_Delay(500);
+
+    /* Step 3: restore saved state — SET whichever relay was ON. */
+    if (r1) Relay1_Set(true);
+    if (r2) Relay2_Set(true);
     Debug_Print("[CFG] Relay state restored from Flash\r\n");
 }
 
@@ -821,6 +850,7 @@ static void apply_settings(const char *json)
     if (strstr(json, "\"dry_en\":"))             cfg_dry_en = extract_int(json, "dry_en") ? 1 : 0;
     t = extract_int(json, "start_t");            if (t > 0)    cfg_start_t = t;
     Debug_Print("[CFG] Settings updated\r\n");
+    publish_status(); /* reflect new cfg_ values immediately — don't wait for next heartbeat */
 }
 
 /* Apply relay2-specific settings (dry_i/dry_t/dry_en/hp only — voltage shared) */
@@ -834,6 +864,7 @@ static void apply_settings2(const char *json)
     if (strstr(json, "\"dry_en\":"))              cfg_dry_en2 = extract_int(json, "dry_en") ? 1 : 0;
     t = extract_int(json, "start_t");             if (t > 0)    cfg_start_t2 = t;
     Debug_Print("[CFG] Settings2 updated\r\n");
+    publish_status(); /* cfg_dry_en2 is in pump01 status — publish immediately */
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
