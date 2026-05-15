@@ -137,8 +137,10 @@ static bool     relay1 = false;
 static bool     relay2 = false;
 static uint32_t relay1_on_tick = 0;      /* HAL_GetTick() when relay1 last turned ON */
 static uint32_t relay2_on_tick = 0;      /* HAL_GetTick() when relay2 last turned ON */
-static uint32_t running1_start_tick = 0; /* tick when relay1 current first exceeded threshold */
-static uint32_t running2_start_tick = 0; /* tick when relay2 current first exceeded threshold */
+static uint32_t run_accum1_ms = 0;       /* accumulated confirmed-running time for relay1 (ms) */
+static uint32_t run_accum2_ms = 0;       /* accumulated confirmed-running time for relay2 (ms) */
+static uint32_t last_r1_run_tick = 0;    /* HAL_GetTick() of last run_protection tick where r1 was running */
+static uint32_t last_r2_run_tick = 0;    /* HAL_GetTick() of last run_protection tick where r2 was running */
 static bool volt_alert_sent1 = false;    /* voltage fault alert was published for relay1 */
 static bool volt_alert_sent2 = false;    /* voltage fault alert was published for relay2 */
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
@@ -478,18 +480,23 @@ static void RelayState_Save(void); /* forward declaration */
 static void log_relay_event(int relay_num, bool on, const char *reason)
 {
     char payload[96];
-    uint32_t *on_tick   = (relay_num == 2) ? &relay2_on_tick      : &relay1_on_tick;
-    uint32_t *run_tick  = (relay_num == 2) ? &running2_start_tick  : &running1_start_tick;
+    uint32_t *on_tick = (relay_num == 2) ? &relay2_on_tick   : &relay1_on_tick;
+    uint32_t *accum   = (relay_num == 2) ? &run_accum2_ms    : &run_accum1_ms;
+    uint32_t *last_tk = (relay_num == 2) ? &last_r2_run_tick : &last_r1_run_tick;
     if (on) {
         *on_tick  = HAL_GetTick();
-        *run_tick = 0;  /* reset — set later when current first exceeds threshold */
+        *accum    = 0;   /* reset accumulator for new run session */
+        *last_tk  = 0;
         snprintf(payload, sizeof(payload),
                  "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d}", reason, relay_num);
     } else {
-        /* run_s = time from first current detection to OFF, not relay-ON to OFF */
-        uint32_t run_s = *run_tick ? (HAL_GetTick() - *run_tick) / 1000 : 0;
+        /* run_s = total confirmed-running time this session.
+         * Accumulator only increments when current > threshold, so preventer
+         * OFF gaps (current=0) are excluded from the run time. */
+        uint32_t run_s = *accum / 1000;
         *on_tick  = 0;
-        *run_tick = 0;
+        *accum    = 0;
+        *last_tk  = 0;
         snprintf(payload, sizeof(payload),
                  "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d}",
                  reason, (unsigned long)run_s, relay_num);
@@ -652,10 +659,23 @@ static void run_protection(void)
     bool r1_running = relay1 && data_ok && (i > cfg_dry_i);
     bool r2_running = relay2 && data_ok && (i > cfg_dry_i2); /* relay2 uses its own threshold */
 
-    /* Capture the first moment current is detected — used for accurate run_s in logs.
-     * run_s = time from here to relay OFF, excluding soft-starter delay. */
-    if (r1_running && !running1_start_tick) running1_start_tick = HAL_GetTick();
-    if (r2_running && !running2_start_tick) running2_start_tick = HAL_GetTick();
+    /* Accumulate confirmed-running time — only when current > threshold.
+     * Pauses automatically when preventer/timer cuts the contactor (current=0).
+     * Resumes when current returns. run_s in the log reflects actual motor
+     * running time, not wall-clock time from first detection to relay OFF. */
+    uint32_t _now = HAL_GetTick();
+    if (r1_running) {
+        if (last_r1_run_tick) run_accum1_ms += _now - last_r1_run_tick;
+        last_r1_run_tick = _now;
+    } else {
+        last_r1_run_tick = 0;   /* pause accumulator while motor is stopped */
+    }
+    if (r2_running) {
+        if (last_r2_run_tick) run_accum2_ms += _now - last_r2_run_tick;
+        last_r2_run_tick = _now;
+    } else {
+        last_r2_run_tick = 0;
+    }
 
     if (r1_running != prev_r1_running)
     {
