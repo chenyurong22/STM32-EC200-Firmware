@@ -166,6 +166,10 @@ static bool force_status_after_ota = false;
  * before publish_status2() is called. */
 static bool pub_status2_needed = false;
 
+/* Modem stuck-detection: if not CONNECTED for 5 min → hardware reset EC200U via PC14 */
+static uint32_t disconnected_since_ms = 0;
+#define MODEM_HARD_RESET_TIMEOUT_MS 300000UL  /* 5 minutes */
+
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
 static bool     prev_relay1        = false;
@@ -2211,12 +2215,46 @@ void Modem_Process(void)
     /* Full modem reset recovery path: re-run Modem_Init so SSL/MQTT config
      * is restored before attempting any reconnect. */
     if (modem_reinit_pending && !OTA_IsActive()) {
-        modem_reinit_pending = false;
-        recv_payload_pending = false;
-        pub_pending = false;
+        modem_reinit_pending   = false;
+        recv_payload_pending   = false;
+        pub_pending            = false;
+        pub_status2_needed     = false;
+        disconnected_since_ms  = HAL_GetTick(); /* restart stuck timer after reinit */
         OTA_Init();
         Modem_Init(modem_uart);
         return;
+    }
+
+    /* Hardware stuck-detection: if not CONNECTED for 5 minutes, pulse PC14
+     * (EC200U RESET) to force a hardware reset of the modem.  Software
+     * reinit alone cannot recover a modem that has internally crashed.
+     * Not triggered during OTA or within first 5 min of boot. */
+    if (mqtt_state != MQTT_STATE_CONNECTED && !OTA_IsActive()) {
+        if (disconnected_since_ms == 0)
+            disconnected_since_ms = HAL_GetTick();
+
+        if ((int32_t)(HAL_GetTick() - disconnected_since_ms) >
+            (int32_t)MODEM_HARD_RESET_TIMEOUT_MS)
+        {
+            Debug_Print("[MODEM] 5 min stuck — hardware reset EC200U via PC14\r\n");
+            disconnected_since_ms = HAL_GetTick(); /* reset timer — don't rapid-fire */
+            recv_payload_pending  = false;
+            pub_pending           = false;
+            pub_status2_needed    = false;
+
+            /* Pulse RESET LOW for 300 ms — EC200U hardware reset */
+            HAL_GPIO_WritePin(MODEM_RESET_GPIO_Port, MODEM_RESET_Pin, GPIO_PIN_RESET);
+            HAL_Delay(300);
+            HAL_GPIO_WritePin(MODEM_RESET_GPIO_Port, MODEM_RESET_Pin, GPIO_PIN_SET);
+            HAL_Delay(3000); /* wait for modem to boot (EC200U takes ~3 s) */
+
+            /* Re-run full init — SSL/MQTT config must be re-applied after reset */
+            OTA_Init();
+            Modem_Init(modem_uart);
+            return;
+        }
+    } else {
+        disconnected_since_ms = 0; /* connected — clear stuck timer */
     }
 
     /* ── send AT+QIACT=1 after buffer is drained (avoids stale QMTCLOSE/QIDEACT OK) ── */

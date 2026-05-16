@@ -78,6 +78,10 @@ void Debug_Print(const char *msg);  /* send string to USART2 serial monitor */
 #define Relay2_RST_GPIO_Port GPIOB
 #define DE485_Pin_Pin        GPIO_PIN_8   /* RS485 DE/RE direction control */
 #define DE485_Pin_GPIO_Port  GPIOA
+#define MODEM_RESET_Pin      GPIO_PIN_14  /* PC14 → EC200U RESET  (active LOW, pulse ≥100ms) */
+#define MODEM_RESET_GPIO_Port GPIOC
+#define MODEM_PWRKEY_Pin     GPIO_PIN_15  /* PC15 → EC200U PWRKEY (active LOW, hold ≥500ms)  */
+#define MODEM_PWRKEY_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 
