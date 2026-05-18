@@ -516,6 +516,8 @@ class _PumpCardState extends State<PumpCard> {
   Map<String, dynamic> _alerts = {};
   bool? _relay1Cmd;   // null = waiting for Firebase data
   bool _isRunning = false;
+  bool _isOnline  = false;
+  int  _todayRunS = 0;  // sum of run_s for today's completed runs
 
   // Schedule state
   bool      _schedExpanded = false;
@@ -529,6 +531,40 @@ class _PumpCardState extends State<PumpCard> {
     _listenStatus();
     _listenAlerts();
     _listenSchedule();
+    _listenTodayRun();
+  }
+
+  void _listenTodayRun() {
+    final now = DateTime.now();
+    final todayStartMs =
+        DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
+    db
+        .ref('pumps/${widget.pumpId}/logs')
+        .orderByKey()
+        .limitToLast(200)
+        .onValue
+        .listen((event) {
+      final data = event.snapshot.value as Map?;
+      if (data == null || !mounted) return;
+      int sum = 0;
+      for (final v in data.values) {
+        final entry = Map<String, dynamic>.from(v as Map);
+        final ts   = (entry['ts']    as num?)?.toInt() ?? 0;
+        final ev   = entry['event']  as String? ?? '';
+        final runS = (entry['run_s'] as num?)?.toInt() ?? 0;
+        if (ts >= todayStartMs && ev == 'off') sum += runS;
+      }
+      if (mounted) setState(() => _todayRunS = sum);
+    });
+  }
+
+  String _fmtRunTime(int s) {
+    if (s <= 0)   return '0m';
+    if (s < 60)   return '${s}s';
+    if (s < 3600) return '${s ~/ 60}m';
+    final h = s ~/ 3600;
+    final m = (s % 3600) ~/ 60;
+    return m > 0 ? '${h}h ${m}m' : '${h}h';
   }
 
   void _listenStatus() {
@@ -539,6 +575,7 @@ class _PumpCardState extends State<PumpCard> {
         setState(() {
           _relay1Cmd = (s['relay${widget.relayNum}_state'] ?? 0) == 1;
           _isRunning = (s['relay${widget.relayNum}_running'] ?? 0) == 1;
+          _isOnline  = s['online'] ?? false;
         });
       }
     });
@@ -674,42 +711,123 @@ class _PumpCardState extends State<PumpCard> {
           children: [
 
             // ── Header ───────────────────────────────────────────────────────
-            Text(widget.pumpName,
-                style: const TextStyle(
-                    fontSize: 20, fontWeight: FontWeight.bold)),
+            Row(
+              children: [
+                Text(widget.pumpName,
+                    style: const TextStyle(
+                        fontSize: 20, fontWeight: FontWeight.bold)),
+                const Spacer(),
+                const Icon(Icons.timer_outlined, size: 14, color: Colors.blueGrey),
+                const SizedBox(width: 4),
+                Text(
+                  'Today: ${_fmtRunTime(_todayRunS)}${_isRunning ? ' +' : ''}',
+                  style: const TextStyle(fontSize: 12, color: Colors.blueGrey),
+                ),
+              ],
+            ),
             const Divider(),
 
-            // ── Pump status icon ──────────────────────────────────────────────
+            // ── Two-column: left = status indicator, right = relay control ──
             const SizedBox(height: 8),
-            Center(
-              child: Column(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: stateColor.withValues(alpha: 0.1),
-                      border: Border.all(color: stateColor, width: 2.5),
-                    ),
-                    child: Icon(
-                      relayOn ? Icons.water_drop : Icons.water_drop_outlined,
-                      size: 52,
-                      color: stateColor,
-                    ),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                // ── Left: status indicator ──────────────────────────────────
+                Expanded(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(20),
+                        // decoration: BoxDecoration(
+                        //   shape: BoxShape.rectangle,
+                        //   color: stateColor.withValues(alpha: 0.1),
+                        //   border: Border.all(color: stateColor, width: 2.5),
+                        // ),
+                        child: Icon(
+                          relayOn ? Icons.water_drop : Icons.water_drop_outlined,
+                          size: 52,
+                          color: stateColor,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        stateText,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: stateColor,
+                          letterSpacing: 1,
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 6),
-                  Text(
-                    stateText,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.bold,
-                      color: stateColor,
-                      letterSpacing: 1,
-                    ),
+                ),
+
+                // ── Divider between columns ─────────────────────────────────
+                Container(
+                  height: 100,
+                  width: 1,
+                  color: Colors.grey.shade200,
+                  margin: const EdgeInsets.symmetric(horizontal: 12),
+                ),
+
+                // ── Right: relay control ────────────────────────────────────
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // const Text('Relay Control',
+                      //     textAlign: TextAlign.center,
+                      //     style: TextStyle(
+                      //         fontWeight: FontWeight.w600, fontSize: 13)),
+                      const SizedBox(height: 8),
+                      _RelayButton(
+                        label: 'Pump',
+                        isOn: relayOn,
+                        disabled: loading || !_isOnline ||
+                            (widget.otherPumpOn && !relayOn),
+                        onToggle: (val) {
+                          setState(() => _relay1Cmd = val);
+                          widget.onPumpToggle(val);
+                        },
+                      ),
+                      const SizedBox(height: 6),
+                      if (!loading && !_isOnline)
+                        const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.cloud_off, size: 13, color: Colors.grey),
+                            SizedBox(width: 4),
+                            Flexible(
+                              child: Text('Device offline',
+                                  style: TextStyle(
+                                      fontSize: 11, color: Colors.grey)),
+                            ),
+                          ],
+                        )
+                      else if (widget.otherPumpOn && !relayOn && !loading)
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Icon(Icons.info_outline,
+                                size: 13, color: Colors.orange),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                'Turn off ${widget.otherPumpName} first',
+                                style: const TextStyle(
+                                    fontSize: 11, color: Colors.orange),
+                              ),
+                            ),
+                          ],
+                        ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
+
             const SizedBox(height: 12),
 
             // ── Alerts ────────────────────────────────────────────────────────
@@ -734,37 +852,6 @@ class _PumpCardState extends State<PumpCard> {
               ),
               const SizedBox(height: 12),
             ],
-
-            // ── Pump button ───────────────────────────────────────────────────
-            const Text('Relay Control',
-                style: TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: _RelayButton(
-                label: 'Pump',
-                isOn: relayOn,
-                disabled: loading || (widget.otherPumpOn && !relayOn),
-                onToggle: (val) {
-                  setState(() => _relay1Cmd = val);
-                  widget.onPumpToggle(val);
-                },
-              ),
-            ),
-            if (widget.otherPumpOn && !relayOn && !loading) ...[
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  const Icon(Icons.info_outline, size: 14, color: Colors.orange),
-                  const SizedBox(width: 4),
-                  Text(
-                    'Turn off ${widget.otherPumpName} first',
-                    style: const TextStyle(fontSize: 12, color: Colors.orange),
-                  ),
-                ],
-              ),
-            ],
-            const SizedBox(height: 12),
 
             // ── Schedule section ──────────────────────────────────────────────
             InkWell(
@@ -941,8 +1028,8 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
               ],
             ),
             const Divider(),
-            const Text('3-Phase Voltage',
-                style: TextStyle(fontWeight: FontWeight.w600)),
+            // const Text('3-Phase Voltage',
+            //     style: TextStyle(fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
@@ -950,15 +1037,7 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
                 _VoltageChip(label: 'L1', voltage: v1),
                 _VoltageChip(label: 'L2', voltage: v2),
                 _VoltageChip(label: 'L3', voltage: v3),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                const Icon(Icons.bolt, size: 18, color: Colors.orange),
-                const SizedBox(width: 4),
-                Text('Current: ${current.toStringAsFixed(2)} A',
-                    style: const TextStyle(fontSize: 15)),
+                _CurrentChip(current: current),
               ],
             ),
           ],
@@ -994,6 +1073,37 @@ class _VoltageChip extends StatelessWidget {
           Text(label,
               style: TextStyle(color: _color(), fontWeight: FontWeight.bold)),
           Text('${voltage.toStringAsFixed(1)}V',
+              style: TextStyle(color: _color(), fontSize: 13)),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── Current chip ─────────────────────────────────────────────────────────────
+class _CurrentChip extends StatelessWidget {
+  final double current;
+  const _CurrentChip({required this.current});
+
+  Color _color() {
+    if (current <= 0.0) return Colors.grey;
+    if (current > 20.0) return Colors.red;
+    return Colors.orange;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        color: _color().withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: _color().withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        children: [
+          Text('I', style: TextStyle(color: _color(), fontWeight: FontWeight.bold)),
+          Text('${current.toStringAsFixed(2)}A',
               style: TextStyle(color: _color(), fontSize: 13)),
         ],
       ),
