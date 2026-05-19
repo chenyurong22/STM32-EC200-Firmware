@@ -44,6 +44,9 @@ extern const char g_fw_ver[];
 #define PUMP_ID2 "02"                /* relay2 ID  — always PUMP_ID + 1    */
 #define MQTT_USERNAME ""             /* anonymous — broker.emqx.io         */
 #define MQTT_PASSWORD ""
+/* SMS remote-control trusted sender — set to "+91XXXXXXXXXX" to restrict;
+ * leave "" to accept STATUS/RESET commands from ANY sender.               */
+#define SMS_TRUSTED_NUMBER ""
 
 /* ── APN — change to your SIM card ─────────────────────────────────────── */
 /* Airtel: "airtelgprs.com"   Jio: "jionet"   BSNL: "bsnlnet"             */
@@ -144,6 +147,9 @@ static uint32_t last_r2_run_tick = 0;    /* HAL_GetTick() of last run_protection
 static uint32_t run_accum1_saved_ms = 0; /* run_accum1_ms value at last periodic flash save */
 static uint32_t run_accum2_saved_ms = 0; /* run_accum2_ms value at last periodic flash save */
 #define RUN_SAVE_INTERVAL_MS 900000UL    /* save run_accum every 15 min while running */
+/* SMS remote control */
+static bool sms_pending = false; /* +CMTI URC received — read SMS on next process */
+static int  sms_index   = -1;   /* SMS storage index from +CMTI: "SM",<idx>       */
 static bool volt_alert_sent1 = false;    /* voltage fault alert was published for relay1 */
 static bool volt_alert_sent2 = false;    /* voltage fault alert was published for relay2 */
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
@@ -914,6 +920,185 @@ static void apply_settings2(const char *json)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * SMS remote control — STATUS query and hardware RESET via SMS
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Forward declaration — modem_sync_expect is defined later in this file */
+static bool modem_sync_expect(const char *expected, uint32_t timeout_ms);
+
+/* Send an SMS reply to <number>.  Waits for the '>' prompt then sends text. */
+static void sms_reply(const char *number, const char *text)
+{
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"", number);
+    modem_cmd(cmd);
+    /* Wait up to 5 s for the '>' prompt */
+    uint32_t t0 = HAL_GetTick();
+    bool got_prompt = false;
+    while (HAL_GetTick() - t0 < 5000)
+    {
+        uint8_t b;
+        IWDG->KR = 0xAAAAU;
+        if (HAL_UART_Receive(modem_uart, &b, 1, 100) == HAL_OK && b == '>')
+        {
+            got_prompt = true;
+            break;
+        }
+    }
+    if (!got_prompt)
+    {
+        Debug_Print("[SMS] No '>' prompt — reply aborted\r\n");
+        return;
+    }
+    HAL_UART_Transmit(modem_uart, (uint8_t *)text, strlen(text), 3000);
+    uint8_t ctrlz = 0x1A;
+    HAL_UART_Transmit(modem_uart, &ctrlz, 1, 1000);
+    modem_sync_expect("OK", 10000); /* wait for +CMGS: / OK */
+    Debug_Print("[SMS] Reply sent\r\n");
+}
+
+/* Read the stored SMS at sms_index, parse sender + body, act on command. */
+static void sms_process(void)
+{
+    if (!sms_pending) return;
+    sms_pending = false;
+
+    /* Flush any stale UART bytes before sending AT+CMGR */
+    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "AT+CMGR=%d", sms_index);
+    modem_cmd(cmd);
+
+    /* Collect response lines: +CMGR header, body text, then OK */
+    char sender[24] = "";
+    char body[80]   = "";
+    int  hdr_seen   = 0;
+    char lbuf[128];
+    size_t lpos = 0;
+    uint32_t t0 = HAL_GetTick();
+
+    while (HAL_GetTick() - t0 < 5000)
+    {
+        uint8_t b;
+        IWDG->KR = 0xAAAAU;
+        if (HAL_UART_Receive(modem_uart, &b, 1, 50) != HAL_OK)
+            continue;
+        if (b == '\r') continue;
+        if (b == '\n')
+        {
+            lbuf[lpos] = '\0';
+            if (lpos > 0)
+            {
+                if (strstr(lbuf, "+CMGR:"))
+                {
+                    /* Extract sender: +CMGR: "REC UNREAD","+91XXXX","","date" */
+                    const char *q = strchr(lbuf, '"');   /* open " of status   */
+                    if (q) { q = strchr(q + 1, '"'); }   /* close " of status  */
+                    if (q) { q = strchr(q + 1, '"'); }   /* open " of number   */
+                    if (q)
+                    {
+                        q++;
+                        const char *q2 = strchr(q, '"');
+                        if (q2)
+                        {
+                            size_t n = (size_t)(q2 - q);
+                            if (n < sizeof(sender)) { memcpy(sender, q, n); sender[n] = '\0'; }
+                        }
+                    }
+                    hdr_seen = 1;
+                }
+                else if (hdr_seen == 1)
+                {
+                    strncpy(body, lbuf, sizeof(body) - 1);
+                    body[sizeof(body) - 1] = '\0';
+                    hdr_seen = 2;
+                }
+                else if (strcmp(lbuf, "OK") == 0)
+                    break;
+            }
+            lpos = 0;
+        }
+        else
+        {
+            if (lpos < sizeof(lbuf) - 1) lbuf[lpos++] = (char)b;
+        }
+    }
+
+    /* Delete the message right away so storage doesn't fill up */
+    char del[24];
+    snprintf(del, sizeof(del), "AT+CMGD=%d", sms_index);
+    modem_cmd(del);
+    HAL_Delay(300);
+    IWDG->KR = 0xAAAAU;
+
+    /* Trim trailing whitespace from body */
+    size_t bl = strlen(body);
+    while (bl > 0 && (body[bl - 1] == ' ' || body[bl - 1] == '\r' || body[bl - 1] == '\n'))
+        body[--bl] = '\0';
+
+    if (sender[0] == '\0' || body[0] == '\0')
+    {
+        Debug_Print("[SMS] Failed to parse SMS — ignored\r\n");
+        return;
+    }
+
+    {
+        char dbg[80];
+        snprintf(dbg, sizeof(dbg), "[SMS] From=%s Body=%s\r\n", sender, body);
+        Debug_Print(dbg);
+    }
+
+    /* Trusted-number filter: if SMS_TRUSTED_NUMBER is set (non-empty) and
+     * sender doesn't match, drop the message.  When the macro is "" the
+     * compiler folds SMS_TRUSTED_NUMBER[0]=='\0' to true and removes the
+     * block entirely.                                                       */
+    if (SMS_TRUSTED_NUMBER[0] != '\0' && strcmp(sender, SMS_TRUSTED_NUMBER) != 0)
+    {
+        Debug_Print("[SMS] Untrusted sender — ignored\r\n");
+        return;
+    }
+
+    /* Upper-case body for keyword matching */
+    char body_up[sizeof(body)];
+    for (size_t i = 0; i < sizeof(body); i++)
+    {
+        char ch = body[i];
+        body_up[i] = (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch);
+        if (body_up[i] == '\0') break;
+    }
+
+    if (strstr(body_up, "STATUS"))
+    {
+        uint32_t r1s = run_accum1_ms / 1000;
+        uint32_t r2s = run_accum2_ms / 1000;
+        bool mqtt_ok = (mqtt_state == MQTT_STATE_CONNECTED   ||
+                        mqtt_state == MQTT_STATE_PUBLISHING  ||
+                        mqtt_state == MQTT_STATE_PUB_WAIT_OK);
+        char reply[160];
+        snprintf(reply, sizeof(reply),
+                 "P%s/P%s R1:%s R2:%s RT1:%luh%02lum RT2:%luh%02lum MQTT:%s",
+                 PUMP_ID, PUMP_ID2,
+                 relay1 ? "ON" : "OFF",
+                 relay2 ? "ON" : "OFF",
+                 (unsigned long)(r1s / 3600), (unsigned long)((r1s % 3600) / 60),
+                 (unsigned long)(r2s / 3600), (unsigned long)((r2s % 3600) / 60),
+                 mqtt_ok ? "OK" : "NO");
+        sms_reply(sender, reply);
+    }
+    else if (strstr(body_up, "RESET"))
+    {
+        sms_reply(sender, "Resetting...");
+        for (int i = 0; i < 4; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        NVIC_SystemReset();
+    }
+    else
+    {
+        sms_reply(sender, "Cmds: STATUS  RESET");
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Line processor — called for every complete line received from EC200U
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1211,6 +1396,19 @@ static void process_line(const char *line)
             mqtt_state = MQTT_STATE_DISCONNECTED;
         }
         /* else: ignore — stale URC from previous QMTCLOSE */
+        return;
+    }
+
+    /* +CMTI: "SM",<index> — new SMS arrived; schedule read in Modem_Process */
+    if (strstr(line, "+CMTI:"))
+    {
+        const char *p = strrchr(line, ',');
+        if (p)
+        {
+            sms_index   = atoi(p + 1);
+            sms_pending = true;
+            Debug_Print("[SMS] New SMS — queued for read\r\n");
+        }
         return;
     }
 
@@ -2034,6 +2232,15 @@ void Modem_Init(UART_HandleTypeDef *huart)
     if (!modem_sync_cmd_ok("AT+CEREG=0", 2000, 5))
         Debug_Print("[MODEM] WARN: CEREG mode set failed, continuing\r\n");
 
+    /* SMS text mode, +CMTI URC on new message, clear stored messages */
+    modem_cmd("AT+CMGF=1");          /* select text mode                   */
+    HAL_Delay(300);
+    modem_cmd("AT+CNMI=2,1,0,0,0"); /* route new-SMS URC (+CMTI) to UART  */
+    HAL_Delay(300);
+    modem_cmd("AT+CMGD=1,4");       /* delete ALL stored messages (clean slate) */
+    HAL_Delay(300);
+    IWDG->KR = 0xAAAAU;
+
     /* SSL context 1 — used by HTTP client for HTTPS OTA downloads.
      * Must be separate from context 0 (MQTT) so the broker SNI doesn't
      * interfere with GitHub/CDN TLS handshake.                             */
@@ -2245,6 +2452,10 @@ void Modem_Process(void)
         Modem_Init(modem_uart);
         return;
     }
+
+    /* ── SMS remote control — works regardless of MQTT connection state ── */
+    if (!OTA_IsActive())
+        sms_process();
 
     /* ── send AT+QIACT=1 after buffer is drained (avoids stale QMTCLOSE/QIDEACT OK) ── */
     if (mqtt_state == MQTT_STATE_PDP_ACTIVATE && !qiact_sent)
