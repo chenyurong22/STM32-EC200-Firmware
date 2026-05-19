@@ -826,6 +826,14 @@ void OTA_Process(void)
     case OTA_ST_REBOOT:
         if (HAL_GetTick() - ota_state_ms >= 1000)
         {
+            /* Send AT+CFUN=1,1 HERE, while we still have a working UART link
+             * (we just downloaded the firmware through it).  This clears the
+             * EC200U TLS heap from the HTTPS session so App A can reconnect to
+             * MQTT cleanly.  Wait 1 s for the command to be transmitted and the
+             * modem to start its internal reset, then reset the STM32.
+             * App A's Modem_Init will wait for the modem "RDY" URC.          */
+            ota_send("AT+CFUN=1,1");
+            ota_delay_wdg(1000);   /* 1 s — modem receives cmd, starts reset  */
             ota_reboot_sentinel = OTA_REBOOT_SENTINEL;
             NVIC_SystemReset();
         }

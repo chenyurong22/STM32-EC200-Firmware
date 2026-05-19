@@ -1981,16 +1981,16 @@ void Modem_Init(UART_HandleTypeDef *huart)
             ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
             Debug_Print("[OTA] Post-OTA: bootloader CRC fail — old firmware kept\r\n");
         }
-        /* AT+CFUN=1,1 performs a full modem software reset which clears the
-         * TLS heap left over from the HTTPS OTA download, allowing MQTT to
-         * reconnect cleanly.                                                 */
-        Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
-        modem_cmd("AT+CFUN=1,1");
+        /* AT+CFUN=1,1 was already sent by ota.c immediately before
+         * NVIC_SystemReset(), while the UART link was known-good.
+         * The modem is now rebooting — wait for its "RDY" URC (up to 30 s)
+         * then settle for 10 s before issuing any AT commands.              */
+        Debug_Print("[MODEM] OTA reboot — waiting for modem RDY\r\n");
         modem_sync_expect("RDY", 30000);
         for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
         IWDG->KR = 0xAAAAU;
-        Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
+        Debug_Print("[MODEM] Modem ready after OTA reboot\r\n");
     } else {
         /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
