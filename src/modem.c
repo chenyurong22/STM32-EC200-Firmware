@@ -166,12 +166,9 @@ static bool force_status_after_ota = false;
  * before publish_status2() is called. */
 static bool pub_status2_needed = false;
 
-/* Modem stuck-detection: if not CONNECTED for 90 s → hardware reset EC200U via PC14.
- * 90 s covers: OTA reboot (~30 s init) + network registration (~30 s) + margin.
- * Catches the case where ota_reboot PC14 reset in Modem_Init did not fire
- * (e.g. sentinel not detected) and MQTT is still stuck post-OTA.             */
+/* Modem stuck-detection: if not CONNECTED for 5 min → hardware reset EC200U via PC14 */
 static uint32_t disconnected_since_ms = 0;
-#define MODEM_HARD_RESET_TIMEOUT_MS 90000UL   /* 90 seconds */
+#define MODEM_HARD_RESET_TIMEOUT_MS 300000UL  /* 5 minutes */
 
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
@@ -1981,16 +1978,25 @@ void Modem_Init(UART_HandleTypeDef *huart)
             ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
             Debug_Print("[OTA] Post-OTA: bootloader CRC fail — old firmware kept\r\n");
         }
-        /* AT+CFUN=1,1 was already sent by ota.c immediately before
-         * NVIC_SystemReset(), while the UART link was known-good.
-         * The modem is now rebooting — wait for its "RDY" URC (up to 30 s)
-         * then settle for 10 s before issuing any AT commands.              */
-        Debug_Print("[MODEM] OTA reboot — waiting for modem RDY\r\n");
-        modem_sync_expect("RDY", 30000);
+        /* AT+QHTTPSTOP does NOT fully free the TLS context-1 heap on the
+         * EC200U after an HTTPS OTA download.  Without clearing it,
+         * AT+QMTOPEN cannot allocate SSL buffers for MQTT context 0 and
+         * MQTT never reconnects after OTA (confirmed: QMTOPEN? returns
+         * just "OK" — no active session).  AT+CFUN=1,1 performs a full
+         * modem software reset which clears all TLS heap.
+         * OTA_IsActive() returns true during OTA_ST_REBOOT so the
+         * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
+        Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
+        modem_cmd("AT+CFUN=1,1");
+        /* Wait up to 30 s for the "RDY" URC signalling modem restart done.
+         * modem_sync_expect() pets IWDG every 1 ms — watchdog safe.       */
+        bool rdy_seen = modem_sync_expect("RDY", 30000);
+        (void)rdy_seen;
+        /* 10 s additional settle: SIM CPIN, partial network registration   */
         for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
         IWDG->KR = 0xAAAAU;
-        Debug_Print("[MODEM] Modem ready after OTA reboot\r\n");
+        Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
     } else {
         /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
