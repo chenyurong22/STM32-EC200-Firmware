@@ -826,11 +826,18 @@ void OTA_Process(void)
     case OTA_ST_REBOOT:
         if (HAL_GetTick() - ota_state_ms >= 1000)
         {
-            ota_send("AT+QHTTPSTOP");
-            ota_delay_wdg(3000);
-            ota_send("AT+QIDEACT=1");
-            ota_delay_wdg(5000);
-            ota_reboot_sentinel = OTA_REBOOT_SENTINEL;  /* mark intentional OTA reboot */
+            /* Hardware-reset the EC200U HERE, before resetting the STM32.
+             * This is more reliable than AT+CFUN=1,1 or relying on the
+             * ota_reboot sentinel in Modem_Init — it works even if the
+             * sentinel is not preserved through the bootloader.
+             * PC14 LOW 300ms = hardware reset; modem starts booting during
+             * the 3s wait, so by the time App A calls Modem_Init it is
+             * already in a clean state. */
+            HAL_GPIO_WritePin(MODEM_RESET_GPIO_Port, MODEM_RESET_Pin, GPIO_PIN_RESET);
+            ota_delay_wdg(300);   /* 300 ms LOW — EC200U RESET pulse        */
+            HAL_GPIO_WritePin(MODEM_RESET_GPIO_Port, MODEM_RESET_Pin, GPIO_PIN_SET);
+            ota_delay_wdg(3000);  /* 3 s — modem boots during this window   */
+            ota_reboot_sentinel = OTA_REBOOT_SENTINEL;
             NVIC_SystemReset();
         }
         break;
