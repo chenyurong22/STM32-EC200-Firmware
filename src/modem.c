@@ -166,9 +166,12 @@ static bool force_status_after_ota = false;
  * before publish_status2() is called. */
 static bool pub_status2_needed = false;
 
-/* Modem stuck-detection: if not CONNECTED for 5 min → hardware reset EC200U via PC14 */
+/* Modem stuck-detection: if not CONNECTED for 90 s → hardware reset EC200U via PC14.
+ * 90 s covers: OTA reboot (~30 s init) + network registration (~30 s) + margin.
+ * Catches the case where ota_reboot PC14 reset in Modem_Init did not fire
+ * (e.g. sentinel not detected) and MQTT is still stuck post-OTA.             */
 static uint32_t disconnected_since_ms = 0;
-#define MODEM_HARD_RESET_TIMEOUT_MS 300000UL  /* 5 minutes */
+#define MODEM_HARD_RESET_TIMEOUT_MS 90000UL   /* 90 seconds */
 
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
