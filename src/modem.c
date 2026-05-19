@@ -1086,6 +1086,52 @@ static void sms_process(void)
                  mqtt_ok ? "OK" : "NO");
         sms_reply(sender, reply);
     }
+    else if (strstr(body_up, "PUMP1 ON"))
+    {
+        if (relay2)
+            sms_reply(sender, "P1 ON BLOCKED: P2 active");
+        else if (is_volt_fault())
+            sms_reply(sender, "P1 ON BLOCKED: volt fault");
+        else if (HAL_GetTick() < lockout_until)
+            sms_reply(sender, "P1 ON BLOCKED: lockout");
+        else
+        {
+            bool prev1 = relay1;
+            Relay1_Set(true);
+            if (relay1 != prev1) { log_relay_event(1, true,  "sms"); publish_status(); }
+            sms_reply(sender, relay1 ? "P1: ON" : "P1 ON failed");
+        }
+    }
+    else if (strstr(body_up, "PUMP1 OFF"))
+    {
+        bool prev1 = relay1;
+        Relay1_Set(false);
+        if (relay1 != prev1) { log_relay_event(1, false, "sms"); publish_status(); }
+        sms_reply(sender, "P1: OFF");
+    }
+    else if (strstr(body_up, "PUMP2 ON"))
+    {
+        if (relay1)
+            sms_reply(sender, "P2 ON BLOCKED: P1 active");
+        else if (is_volt_fault())
+            sms_reply(sender, "P2 ON BLOCKED: volt fault");
+        else if (HAL_GetTick() < lockout_until2)
+            sms_reply(sender, "P2 ON BLOCKED: lockout");
+        else
+        {
+            bool prev2 = relay2;
+            Relay2_Set(true);
+            if (relay2 != prev2) { log_relay_event(2, true,  "sms"); publish_status2(); }
+            sms_reply(sender, relay2 ? "P2: ON" : "P2 ON failed");
+        }
+    }
+    else if (strstr(body_up, "PUMP2 OFF"))
+    {
+        bool prev2 = relay2;
+        Relay2_Set(false);
+        if (relay2 != prev2) { log_relay_event(2, false, "sms"); publish_status2(); }
+        sms_reply(sender, "P2: OFF");
+    }
     else if (strstr(body_up, "RESET"))
     {
         sms_reply(sender, "Resetting...");
@@ -1094,7 +1140,7 @@ static void sms_process(void)
     }
     else
     {
-        sms_reply(sender, "Cmds: STATUS  RESET");
+        sms_reply(sender, "Cmds: STATUS PUMP1 ON PUMP1 OFF PUMP2 ON PUMP2 OFF RESET");
     }
 }
 
