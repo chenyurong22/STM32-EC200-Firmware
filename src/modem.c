@@ -143,7 +143,7 @@ static uint32_t last_r1_run_tick = 0;    /* HAL_GetTick() of last run_protection
 static uint32_t last_r2_run_tick = 0;    /* HAL_GetTick() of last run_protection tick where r2 was running */
 static uint32_t run_accum1_saved_ms = 0; /* run_accum1_ms value at last periodic flash save */
 static uint32_t run_accum2_saved_ms = 0; /* run_accum2_ms value at last periodic flash save */
-#define RUN_SAVE_INTERVAL_MS 1800000UL   /* save run_accum every 30 min while running */
+#define RUN_SAVE_INTERVAL_MS 900000UL    /* save run_accum every 15 min while running */
 static bool volt_alert_sent1 = false;    /* voltage fault alert was published for relay1 */
 static bool volt_alert_sent2 = false;    /* voltage fault alert was published for relay2 */
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
