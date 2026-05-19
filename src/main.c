@@ -359,7 +359,6 @@ static void MX_GPIO_Init(void)
 
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /* PA1 — pump1 SET coil (transistor driver), idle LOW */
   HAL_GPIO_WritePin(Relay_Pin_GPIO_Port, Relay_Pin_Pin, GPIO_PIN_RESET);
@@ -383,19 +382,6 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(Relay2_RST_GPIO_Port, Relay2_RST_Pin, GPIO_PIN_RESET);
   GPIO_InitStruct.Pin = Relay2_RST_Pin;
   HAL_GPIO_Init(Relay2_RST_GPIO_Port, &GPIO_InitStruct);
-
-  /* PC14 — EC200U RESET (active LOW); idle HIGH = reset inactive */
-  HAL_GPIO_WritePin(MODEM_RESET_GPIO_Port, MODEM_RESET_Pin, GPIO_PIN_SET);
-  GPIO_InitStruct.Pin   = MODEM_RESET_Pin;
-  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull  = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(MODEM_RESET_GPIO_Port, &GPIO_InitStruct);
-
-  /* PC15 — EC200U PWRKEY (active LOW); idle HIGH = key released */
-  HAL_GPIO_WritePin(MODEM_PWRKEY_GPIO_Port, MODEM_PWRKEY_Pin, GPIO_PIN_SET);
-  GPIO_InitStruct.Pin = MODEM_PWRKEY_Pin;
-  HAL_GPIO_Init(MODEM_PWRKEY_GPIO_Port, &GPIO_InitStruct);
 
   /* RS485 DE/RE — PA8, default LOW (receive mode) */
   HAL_GPIO_WritePin(DE485_Pin_GPIO_Port, DE485_Pin_Pin, GPIO_PIN_RESET);
