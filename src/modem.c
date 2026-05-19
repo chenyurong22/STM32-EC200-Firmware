@@ -141,6 +141,9 @@ static uint32_t run_accum1_ms = 0;       /* accumulated confirmed-running time f
 static uint32_t run_accum2_ms = 0;       /* accumulated confirmed-running time for relay2 (ms) */
 static uint32_t last_r1_run_tick = 0;    /* HAL_GetTick() of last run_protection tick where r1 was running */
 static uint32_t last_r2_run_tick = 0;    /* HAL_GetTick() of last run_protection tick where r2 was running */
+static uint32_t run_accum1_saved_ms = 0; /* run_accum1_ms value at last periodic flash save */
+static uint32_t run_accum2_saved_ms = 0; /* run_accum2_ms value at last periodic flash save */
+#define RUN_SAVE_INTERVAL_MS 1800000UL   /* save run_accum every 30 min while running */
 static bool volt_alert_sent1 = false;    /* voltage fault alert was published for relay1 */
 static bool volt_alert_sent2 = false;    /* voltage fault alert was published for relay2 */
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
@@ -480,13 +483,15 @@ static void RelayState_Save(void); /* forward declaration */
 static void log_relay_event(int relay_num, bool on, const char *reason)
 {
     char payload[96];
-    uint32_t *on_tick = (relay_num == 2) ? &relay2_on_tick   : &relay1_on_tick;
-    uint32_t *accum   = (relay_num == 2) ? &run_accum2_ms    : &run_accum1_ms;
-    uint32_t *last_tk = (relay_num == 2) ? &last_r2_run_tick : &last_r1_run_tick;
+    uint32_t *on_tick   = (relay_num == 2) ? &relay2_on_tick        : &relay1_on_tick;
+    uint32_t *accum     = (relay_num == 2) ? &run_accum2_ms         : &run_accum1_ms;
+    uint32_t *last_tk   = (relay_num == 2) ? &last_r2_run_tick      : &last_r1_run_tick;
+    uint32_t *saved_ms  = (relay_num == 2) ? &run_accum2_saved_ms   : &run_accum1_saved_ms;
     if (on) {
-        *on_tick  = HAL_GetTick();
-        *accum    = 0;   /* reset accumulator for new run session */
-        *last_tk  = 0;
+        *on_tick   = HAL_GetTick();
+        *accum     = 0;   /* reset accumulator for new run session */
+        *last_tk   = 0;
+        *saved_ms  = 0;
         snprintf(payload, sizeof(payload),
                  "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d}", reason, relay_num);
     } else {
@@ -677,6 +682,18 @@ static void run_protection(void)
         last_r2_run_tick = 0;
     }
 
+    /* Persist run_accum to flash every 30 min while a relay is running.
+     * On power cut the last saved value is restored in RelayState_Load so
+     * at most 30 min of run time is lost.  Saves are skipped when both
+     * relays are idle to avoid unnecessary flash wear.                   */
+    if ((r1_running && run_accum1_ms - run_accum1_saved_ms >= RUN_SAVE_INTERVAL_MS) ||
+        (r2_running && run_accum2_ms - run_accum2_saved_ms >= RUN_SAVE_INTERVAL_MS))
+    {
+        run_accum1_saved_ms = run_accum1_ms;
+        run_accum2_saved_ms = run_accum2_ms;
+        RelayState_Save();
+    }
+
     if (r1_running != prev_r1_running)
     {
         prev_r1_running = r1_running;
@@ -786,24 +803,28 @@ static bool modem_is_exact_reboot_urc(const char *line);
 /* ── Relay state persistence (Flash page 31 = 0x0800F800, 2KB) ──────────────
  * Saves relay1/relay2 ON/OFF state so a power-cycle reboot restores the
  * physical latching-relay position correctly instead of defaulting to OFF. */
-#define RELAY_STATE_MAGIC  0xFEED5A5AU
+#define RELAY_STATE_MAGIC  0xFEED5A5CU  /* bumped: struct now includes run_accum */
 #define RELAY_STATE_ADDR   0x0800F800U
 #define RELAY_STATE_PAGE   31U
 
 typedef struct {
     uint32_t magic;
-    uint32_t relay1;   /* 1 = ON, 0 = OFF */
+    uint32_t relay1;         /* 1 = ON, 0 = OFF */
     uint32_t relay2;
-    uint32_t _pad;     /* 16 bytes total — 2 doublewords */
+    uint32_t run_accum1_ms;  /* saved running time relay1 — restored on power-on */
+    uint32_t run_accum2_ms;  /* saved running time relay2 — restored on power-on */
+    uint32_t _pad;           /* 24 bytes total — 3 doublewords */
 } RelayState_t;
 
 static void RelayState_Save(void)
 {
     RelayState_t s;
-    s.magic  = RELAY_STATE_MAGIC;
-    s.relay1 = relay1 ? 1U : 0U;
-    s.relay2 = relay2 ? 1U : 0U;
-    s._pad   = 0U;
+    s.magic         = RELAY_STATE_MAGIC;
+    s.relay1        = relay1 ? 1U : 0U;
+    s.relay2        = relay2 ? 1U : 0U;
+    s.run_accum1_ms = run_accum1_ms;
+    s.run_accum2_ms = run_accum2_ms;
+    s._pad          = 0U;
 
     HAL_FLASH_Unlock();
     FLASH_EraseInitTypeDef erase = {
@@ -814,10 +835,11 @@ static void RelayState_Save(void)
     uint32_t page_err = 0;
     HAL_FLASHEx_Erase(&erase, &page_err);
 
-    uint64_t buf[2];
+    uint64_t buf[3];
     memcpy(buf, &s, sizeof(s));
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR,       buf[0]);
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR + 8U,  buf[1]);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR,        buf[0]);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR + 8U,   buf[1]);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, RELAY_STATE_ADDR + 16U,  buf[2]);
     HAL_FLASH_Lock();
     Debug_Print("[CFG] Relay state saved to Flash\r\n");
 }
@@ -835,6 +857,10 @@ static void RelayState_Load(void)
     }
     bool r1 = p->relay1 ? true : false;
     bool r2 = (p->relay2 && !r1) ? true : false;  /* interlock: relay2 OFF if relay1 ON */
+
+    /* Restore accumulated run time — only meaningful if relay was ON when saved */
+    if (r1) run_accum1_ms = p->run_accum1_ms;
+    if (r2) run_accum2_ms = p->run_accum2_ms;
 
     /* Step 1: RESET both relays to a known OFF state first.
      * Bistable relays hold their mechanical position through power-loss so
