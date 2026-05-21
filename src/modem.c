@@ -395,11 +395,12 @@ static void publish_status(void)
     float v3 = Sensor_ReadVoltagePhase3();
     float i  = Sensor_ReadCurrentACS712();
 
-    char sv1[12], sv2[12], sv3[12], sci[12];
+    char sv1[12], sv2[12], sv3[12], sci[12], skw[10];
     fmt_f1(sv1, sizeof(sv1), v1);
     fmt_f1(sv2, sizeof(sv2), v2);
     fmt_f1(sv3, sizeof(sv3), v3);
     fmt_f2(sci, sizeof(sci), i);
+    fmt_f2(skw, sizeof(skw), Modbus_GetKW());
 
     char scfg_ov[10], scfg_uv[10], scfg_pl[10], scfg_dry_i[10], scfg_dry_i2[10];
     fmt_f1(scfg_ov,    sizeof(scfg_ov),    cfg_ov);
@@ -412,12 +413,12 @@ static void publish_status(void)
     bool r1_running = relay1 && data_ok && (i > cfg_dry_i);
     bool r2_running = relay2 && data_ok && (i > cfg_dry_i2); /* relay2 uses its own threshold */
 
-    char payload[640];
+    char payload[660];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"relay1_running\":%d,\"relay2_running\":%d,"
              "\"v1\":%s,\"v2\":%s,\"v3\":%s,"
-             "\"current\":%s,"
+             "\"current\":%s,\"kw\":%s,"
              "\"dry_run\":%s,\"dry_run2\":%s,\"online\":true,"
              "\"mb_ok\":%d,\"mb_rx\":%d,\"rssi\":%d,\"boot_phase\":%u,"
              "\"fw\":\"%s\","
@@ -428,7 +429,7 @@ static void publish_status(void)
              relay2 ? 1 : 0,
              r1_running ? 1 : 0,
              r2_running ? 1 : 0,
-             sv1, sv2, sv3, sci,
+             sv1, sv2, sv3, sci, skw,
              dry_run_tripped  ? "true" : "false",
              dry_run_tripped2 ? "true" : "false",
              data_ok ? 1 : 0,
@@ -688,9 +689,9 @@ static void run_protection(void)
         last_r2_run_tick = 0;
     }
 
-    /* Persist run_accum to flash every 30 min while a relay is running.
+    /* Persist run_accum to flash every 15 min while a relay is running.
      * On power cut the last saved value is restored in RelayState_Load so
-     * at most 30 min of run time is lost.  Saves are skipped when both
+     * at most 15 min of run time is lost.  Saves are skipped when both
      * relays are idle to avoid unnecessary flash wear.                   */
     if ((r1_running && run_accum1_ms - run_accum1_saved_ms >= RUN_SAVE_INTERVAL_MS) ||
         (r2_running && run_accum2_ms - run_accum2_saved_ms >= RUN_SAVE_INTERVAL_MS))
@@ -864,9 +865,11 @@ static void RelayState_Load(void)
     bool r1 = p->relay1 ? true : false;
     bool r2 = (p->relay2 && !r1) ? true : false;  /* interlock: relay2 OFF if relay1 ON */
 
-    /* Restore accumulated run time — only meaningful if relay was ON when saved */
-    if (r1) run_accum1_ms = p->run_accum1_ms;
-    if (r2) run_accum2_ms = p->run_accum2_ms;
+    /* Restore accumulated run time — only meaningful if relay was ON when saved.
+     * Also sync the saved_ms sentinel so the first running tick does not
+     * immediately trigger a redundant flash save (save_ms=0 vs accum>900 s). */
+    if (r1) { run_accum1_ms = p->run_accum1_ms; run_accum1_saved_ms = p->run_accum1_ms; }
+    if (r2) { run_accum2_ms = p->run_accum2_ms; run_accum2_saved_ms = p->run_accum2_ms; }
 
     /* Step 1: RESET both relays to a known OFF state first.
      * Bistable relays hold their mechanical position through power-loss so
@@ -882,9 +885,11 @@ static void RelayState_Load(void)
      * sent, avoiding inrush current and mechanical stress on re-close. */
     HAL_Delay(500);
 
-    /* Step 3: restore saved state — SET whichever relay was ON. */
-    if (r1) Relay1_Set(true);
-    if (r2) Relay2_Set(true);
+    /* Step 3: restore saved state — SET whichever relay was ON.
+     * Record relay_on_tick so the startup grace window (UV/PL suppression)
+     * applies correctly — without this, inrush dip on restore could false-trip. */
+    if (r1) { Relay1_Set(true); relay1_on_tick = HAL_GetTick(); }
+    if (r2) { Relay2_Set(true); relay2_on_tick = HAL_GetTick(); }
     Debug_Print("[CFG] Relay state restored from Flash\r\n");
 }
 

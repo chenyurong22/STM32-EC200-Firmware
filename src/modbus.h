@@ -3,7 +3,8 @@
  * Uses USART2 (PA2=TX, PA3=RX) + PA8 for DE/RE direction control.
  *
  * Poll interval: 2 seconds.
- * Registers read: V1N, V2N, V3N, I1, I2, I3, PF1, PF2, PF3 via FC04 (input registers).
+ * Registers: FC04 request 1 — V1N/V2N/V3N, I1/I2/I3 (start 0x0000, count 22)
+ *            FC04 request 2 — Total kW (start 0x002A, count 2); issued after request 1.
  */
 #pragma once
 #include "stm32g0xx_hal.h"
@@ -23,5 +24,6 @@ float   Modbus_GetI3(void);         /* Phase 3 current       (Amps)  */
 float   Modbus_GetPF1(void);        /* Phase 1 power factor  (-1..1) */
 float   Modbus_GetPF2(void);        /* Phase 2 power factor  (-1..1) */
 float   Modbus_GetPF3(void);        /* Phase 3 power factor  (-1..1) */
+float   Modbus_GetKW(void);         /* Total active power     (kW)   */
 bool    Modbus_IsDataValid(void);   /* true if last CRC passed       */
 uint8_t Modbus_GetLastRx(void);     /* bytes received in last tx/rx  */
