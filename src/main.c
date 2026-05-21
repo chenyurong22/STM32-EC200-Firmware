@@ -21,7 +21,7 @@
 #include "modem.h"
 #include "modbus.h"
 #include "ota.h"
-/* #include "lora.h" */  /* LoRa disabled — not in use */
+#include "lora.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -144,8 +144,8 @@ int main(void)
   g_boot_phase = 6;
   WDG_KICK();
 
-  /* MX_USART3_UART_Init(); */  /* LoRa disabled — Reyax RYL998 not in use */
-  /* LoRa_Init(&huart3);    */
+  MX_USART3_UART_Init();
+  LoRa_Init(&huart3);
   g_boot_phase = 7;
   WDG_KICK();
 
@@ -185,7 +185,7 @@ int main(void)
   {
     g_boot_phase = 11;
     Modem_Process();
-    /* LoRa_Process(); */  /* LoRa disabled */
+    LoRa_Process();
     if (!OTA_IsActive()) {
       Modbus_Process();
     }

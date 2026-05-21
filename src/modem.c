@@ -27,6 +27,7 @@
 #include "modbus.h"
 #include "main.h"
 #include "ota.h"
+#include "lora.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,6 +148,14 @@ static uint32_t last_r2_run_tick = 0;    /* HAL_GetTick() of last run_protection
 static uint32_t run_accum1_saved_ms = 0; /* run_accum1_ms value at last periodic flash save */
 static uint32_t run_accum2_saved_ms = 0; /* run_accum2_ms value at last periodic flash save */
 #define RUN_SAVE_INTERVAL_MS 900000UL    /* save run_accum every 15 min while running */
+
+/* ── Network real-time clock (synced via AT+CCLK? after MQTT connect) ────── */
+static uint64_t rtc_unix_ms   = 0;     /* UTC Unix time (ms) at rtc_tick_base  */
+static uint32_t rtc_tick_base = 0;     /* HAL_GetTick() when rtc_unix_ms set   */
+static bool     cclk_needed   = false; /* request sync on next idle MQTT slot  */
+static uint32_t last_cclk_ms  = 0;     /* HAL_GetTick() of last CCLK sync      */
+#define CCLK_RESYNC_MS  21600000UL     /* re-sync every 6 hours                */
+
 /* SMS remote control */
 static bool sms_pending = false; /* +CMTI URC received — read SMS on next process */
 static int  sms_index   = -1;   /* SMS storage index from +CMTI: "SM",<idx>       */
@@ -326,6 +335,65 @@ static void blink_n(int n)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Network RTC helpers
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static bool rtc_is_leap(int y)
+{
+    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+}
+
+/* Days before each month in a non-leap year */
+static const uint16_t k_mdays[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+
+/* Convert AT+CCLK fields to UTC Unix milliseconds.
+ * yy     : 2-digit year (e.g. 26 → 2026)
+ * tz_qh  : timezone offset in quarter-hours (+22 = IST +5:30) */
+static uint64_t cclk_to_unix_ms(int yy, int mo, int dd,
+                                 int hh, int mm, int ss, int tz_qh)
+{
+    int year = 2000 + yy;
+    /* Days from 1970-01-01 to year-01-01 using proleptic Gregorian calendar */
+    int y = year - 1;
+    long days = (long)y * 365L + (long)(y / 4) - (long)(y / 100) + (long)(y / 400)
+              - 719162L; /* pre-computed offset for 1969: 1969*365+492-19+4 */
+    /* Days within the year */
+    days += k_mdays[mo - 1];
+    if (mo > 2 && rtc_is_leap(year)) days++;
+    days += dd - 1;
+    /* Local seconds since epoch, then subtract tz offset to get UTC */
+    int64_t utc_s = (int64_t)days * 86400LL
+                  + (int64_t)hh * 3600LL + (int64_t)mm * 60LL + (int64_t)ss
+                  - (int64_t)tz_qh * 15LL * 60LL;
+    return (uint64_t)(utc_s * 1000LL);
+}
+
+/* Parse "+CCLK: \"26/05/21,10:30:00+22\"" and update rtc_unix_ms */
+static void parse_cclk_line(const char *line)
+{
+    const char *p = strstr(line, "+CCLK:");
+    if (!p) return;
+    p += 6;
+    while (*p == ' ') p++;
+    if (*p == '"') p++;
+    int yy = 0, mo = 0, dd = 0, hh = 0, mm = 0, ss = 0, tz = 0;
+    if (sscanf(p, "%d/%d/%d,%d:%d:%d%d", &yy, &mo, &dd, &hh, &mm, &ss, &tz) < 6)
+        return;
+    if (yy < 24 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return; /* sanity */
+    rtc_unix_ms   = cclk_to_unix_ms(yy, mo, dd, hh, mm, ss, tz);
+    rtc_tick_base = HAL_GetTick();
+    last_cclk_ms  = rtc_tick_base;
+    Debug_Print("[RTC] Network time synced\r\n");
+}
+
+/* Public getter — returns 0 until first sync */
+uint64_t Modem_GetUnixMs(void)
+{
+    if (!rtc_unix_ms) return 0;
+    return rtc_unix_ms + (uint64_t)(HAL_GetTick() - rtc_tick_base);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Connection status
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -489,18 +557,24 @@ static void RelayState_Save(void); /* forward declaration */
 
 static void log_relay_event(int relay_num, bool on, const char *reason)
 {
-    char payload[96];
+    char payload[128];
     uint32_t *on_tick   = (relay_num == 2) ? &relay2_on_tick        : &relay1_on_tick;
     uint32_t *accum     = (relay_num == 2) ? &run_accum2_ms         : &run_accum1_ms;
     uint32_t *last_tk   = (relay_num == 2) ? &last_r2_run_tick      : &last_r1_run_tick;
     uint32_t *saved_ms  = (relay_num == 2) ? &run_accum2_saved_ms   : &run_accum1_saved_ms;
+    uint64_t ts_ms = Modem_GetUnixMs(); /* 0 until network time synced */
     if (on) {
         *on_tick   = HAL_GetTick();
         *accum     = 0;   /* reset accumulator for new run session */
         *last_tk   = 0;
         *saved_ms  = 0;
-        snprintf(payload, sizeof(payload),
-                 "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d}", reason, relay_num);
+        if (ts_ms)
+            snprintf(payload, sizeof(payload),
+                     "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d,\"ts\":%llu}",
+                     reason, relay_num, (unsigned long long)ts_ms);
+        else
+            snprintf(payload, sizeof(payload),
+                     "{\"event\":\"on\",\"reason\":\"%s\",\"relay\":%d}", reason, relay_num);
     } else {
         /* run_s = total confirmed-running time this session.
          * Accumulator only increments when current > threshold, so preventer
@@ -509,9 +583,14 @@ static void log_relay_event(int relay_num, bool on, const char *reason)
         *on_tick  = 0;
         *accum    = 0;
         *last_tk  = 0;
-        snprintf(payload, sizeof(payload),
-                 "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d}",
-                 reason, (unsigned long)run_s, relay_num);
+        if (ts_ms)
+            snprintf(payload, sizeof(payload),
+                     "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d,\"ts\":%llu}",
+                     reason, (unsigned long)run_s, relay_num, (unsigned long long)ts_ms);
+        else
+            snprintf(payload, sizeof(payload),
+                     "{\"event\":\"off\",\"reason\":\"%s\",\"run_s\":%lu,\"relay\":%d}",
+                     reason, (unsigned long)run_s, relay_num);
     }
     queue_publish((relay_num == 2) ? TOPIC_LOG2 : TOPIC_LOG, payload);
     RelayState_Save();
@@ -1287,6 +1366,19 @@ static void process_line(const char *line)
                     Debug_Print(r1 ? "[CMD] Relay1 ON\r\n" : "[CMD] Relay1 OFF\r\n");
                 }
             }
+            /* relay3 / relay4 — forwarded via LoRa to slave Blue Pill
+             * pump/01/cmd {"relay3":1}  → slave P1 ON  (pump03)
+             * pump/01/cmd {"relay4":1}  → slave P2 ON  (pump04) */
+            int r3 = extract_int(json, "relay3");
+            if (r3 >= 0) {
+                LoRa_SendRelay(1, r3 == 1);
+                Debug_Print(r3 ? "[CMD] LoRa P1 ON\r\n" : "[CMD] LoRa P1 OFF\r\n");
+            }
+            int r4 = extract_int(json, "relay4");
+            if (r4 >= 0) {
+                LoRa_SendRelay(2, r4 == 1);
+                Debug_Print(r4 ? "[CMD] LoRa P2 ON\r\n" : "[CMD] LoRa P2 OFF\r\n");
+            }
             return;
         }
         /* Plain URL payload on next line (non-JSON bridge format). */
@@ -1429,6 +1521,9 @@ static void process_line(const char *line)
         }
         return;
     }
+
+    /* +CCLK: response to AT+CCLK? — sync network real time */
+    if (strstr(line, "+CCLK:")) { parse_cclk_line(line); return; }
 
     /* +QMTSTAT: server closed the connection.
      * IGNORE in early states (NET_WAIT→SUBSCRIBING) — it is a stale URC from
@@ -1762,7 +1857,8 @@ static void process_line(const char *line)
             rxpos = 0;
             HAL_IWDG_Refresh(&hiwdg);
 
-            mqtt_state = MQTT_STATE_CONNECTED;
+            mqtt_state   = MQTT_STATE_CONNECTED;
+            cclk_needed  = true; /* request network time sync on first idle slot */
             /* publish current state immediately so Firebase is up to date on connect */
             prev_relay1       = relay1;
             prev_relay2       = relay2;
@@ -2566,6 +2662,15 @@ void Modem_Process(void)
     /* ── periodic tasks (only when fully connected) ── */
     if (mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive())
     {
+
+        /* Network time sync — request AT+CCLK? once after connect, then every 6h */
+        if (!pub_pending &&
+            (cclk_needed ||
+             (last_cclk_ms && HAL_GetTick() - last_cclk_ms >= CCLK_RESYNC_MS)))
+        {
+            cclk_needed = false;
+            modem_cmd("AT+CCLK?");
+        }
 
         /* Deferred pump02 status — send as soon as the queue is free */
         if (pub_status2_needed && !pub_pending)
