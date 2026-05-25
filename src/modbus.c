@@ -241,6 +241,12 @@ void Modbus_Process(void)
 
     /* ── TX2: send Total kW request (register 0x002A) ──────────────── */
     case MB_TX2: {
+        /* Modbus spec requires ≥ 3.5 character silence between frames.
+         * At 9600 baud that is ~3.65 ms.  MB_PARSE→MB_TX2 happens within
+         * one main-loop tick (~1 ms), so we add an explicit 5 ms delay.
+         * Also drain any stale RX bytes left over from Request 1.        */
+        HAL_Delay(5);
+        { uint8_t _d; while (HAL_UART_Receive(mb_uart, &_d, 1, 1) == HAL_OK) {} }
         tx_buf2[0] = MB_SLAVE;
         tx_buf2[1] = MB_FC;
         tx_buf2[2] = MB2_START_HI;

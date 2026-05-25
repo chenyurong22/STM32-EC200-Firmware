@@ -10,6 +10,7 @@ import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'logs_page.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'auth_screen.dart';
 
 // ─── FCM background handler (must be top-level) ───────────────────────────────
@@ -324,6 +325,7 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
   late String _currentPump;
   int    _startedAt       = 0;
   bool   _expanded        = false;
+  Timer? _ticker;
 
   static const _options = [
     (label: '30 min',  minutes: 30),
@@ -352,6 +354,16 @@ class _RotationScheduleCardState extends State<RotationScheduleCard> {
         });
       }
     });
+    // Refresh remaining time display every minute
+    _ticker = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
   }
 
   String _timeRemaining() {
@@ -516,9 +528,11 @@ class _PumpCardState extends State<PumpCard> {
 
   Map<String, dynamic> _alerts = {};
   bool? _relay1Cmd;   // null = waiting for Firebase data
-  bool _isRunning = false;
-  bool _isOnline  = false;
-  int  _todayRunS = 0;  // sum of run_s for today's completed runs
+  bool  _isRunning        = false;
+  bool  _isOnline         = false;
+  int   _todayRunS        = 0;    // sum of run_s for today's completed runs
+  int   _currentRunStartMs = 0;   // ms epoch when current run started (0 = unknown)
+  Timer? _runTicker;
 
   // Schedule state
   bool      _schedExpanded = false;
@@ -533,6 +547,16 @@ class _PumpCardState extends State<PumpCard> {
     _listenAlerts();
     _listenSchedule();
     _listenTodayRun();
+    // Refresh display every 5 min so current run elapsed time stays current
+    _runTicker = Timer.periodic(const Duration(minutes: 5), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _runTicker?.cancel();
+    super.dispose();
   }
 
   void _listenTodayRun() {
@@ -548,14 +572,21 @@ class _PumpCardState extends State<PumpCard> {
       final data = event.snapshot.value as Map?;
       if (data == null || !mounted) return;
       int sum = 0;
+      int latestOnMs = 0;
       for (final v in data.values) {
         final entry = Map<String, dynamic>.from(v as Map);
         final ts   = (entry['ts']    as num?)?.toInt() ?? 0;
         final ev   = entry['event']  as String? ?? '';
         final runS = (entry['run_s'] as num?)?.toInt() ?? 0;
         if (ts >= todayStartMs && ev == 'off') sum += runS;
+        if (ts >= todayStartMs && ev == 'on' && ts > latestOnMs) latestOnMs = ts;
       }
-      if (mounted) setState(() => _todayRunS = sum);
+      if (mounted) {
+        setState(() {
+          _todayRunS         = sum;
+          _currentRunStartMs = latestOnMs;
+        });
+      }
     });
   }
 
@@ -716,12 +747,12 @@ class _PumpCardState extends State<PumpCard> {
               children: [
                 Text(widget.pumpName,
                     style: const TextStyle(
-                        fontSize: 20, fontWeight: FontWeight.bold)),
+                        fontSize: 16, fontWeight: FontWeight.bold)),
                 const Spacer(),
                 const Icon(Icons.timer_outlined, size: 14, color: Colors.blueGrey),
                 const SizedBox(width: 4),
                 Text(
-                  'Today: ${_fmtRunTime(_todayRunS)}${_isRunning ? ' +' : ''}',
+                  'Today: ${_fmtRunTime(_todayRunS + (_isRunning && _currentRunStartMs > 0 ? (DateTime.now().millisecondsSinceEpoch - _currentRunStartMs) ~/ 1000 : 0))}${_isRunning ? ' +' : ''}',
                   style: const TextStyle(fontSize: 12, color: Colors.blueGrey),
                 ),
               ],
@@ -1147,6 +1178,7 @@ class _SettingsPageState extends State<SettingsPage> {
   final _dryICtrl   = TextEditingController();
   final _dryTCtrl   = TextEditingController();
   final _startTCtrl = TextEditingController();
+  final _uvRstCtrl  = TextEditingController();
 
   late String _pumpId;  // selected pump
   int?   _selectedHp;               // null=custom, 5=5HP, 75=7.5HP
@@ -1161,11 +1193,14 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _saving  = false;
 
   double? _devOv, _devUv, _devPl, _devDryI;
-  int?    _devDryT, _devStartT, _devHp, _devDryEn;
+  int?    _devDryT, _devStartT, _devHp, _devDryEn, _devUvRst;
 
   // Relay2-specific "Active on device" values (pump02 only)
   double? _devDryI2;
   int?    _devDryT2, _devStartT2, _devHp2, _devDryEn2;
+
+  // Global notification toggle (stored in SharedPreferences)
+  bool _notifEnabled = true;
 
   StreamSubscription<DatabaseEvent>? _devSub;
 
@@ -1175,6 +1210,37 @@ class _SettingsPageState extends State<SettingsPage> {
     _pumpId = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
     _load();
     _listenDeviceSettings();
+    _loadNotifPref();
+  }
+
+  Future<void> _loadNotifPref() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) setState(() => _notifEnabled = prefs.getBool('notifications_enabled') ?? true);
+  }
+
+  Future<void> _setNotifEnabled(bool enabled) async {
+    final messaging = FirebaseMessaging.instance;
+    for (final site in kSites) {
+      for (final pumpId in site.pumpIds) {
+        if (enabled) {
+          await messaging.subscribeToTopic(pumpId);
+        } else {
+          await messaging.unsubscribeFromTopic(pumpId);
+        }
+      }
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('notifications_enabled', enabled);
+    if (mounted) setState(() => _notifEnabled = enabled);
+  }
+
+  @override
+  void dispose() {
+    _devSub?.cancel();
+    _ovCtrl.dispose(); _uvCtrl.dispose(); _plCtrl.dispose();
+    _dryICtrl.dispose(); _dryTCtrl.dispose();
+    _startTCtrl.dispose(); _uvRstCtrl.dispose();
+    super.dispose();
   }
 
   // The physical STM32 device that owns this pump's relay.
@@ -1208,9 +1274,13 @@ class _SettingsPageState extends State<SettingsPage> {
       _ovCtrl.text   = (s?['ov']    ?? 480).toString();
       _uvCtrl.text   = (s?['uv']    ?? 360).toString();
       _plCtrl.text   = (s?['pl']    ?? 200).toString();
-      _dryICtrl.text   = (s?['dry_i']   ?? 1.5).toString();
-      _dryTCtrl.text   = (s?['dry_t']   ?? 8).toString();
+      // Fall back to defaults if value is missing or was previously zeroed
+      final rawDryI = (s?['dry_i'] as num?)?.toDouble() ?? 0.0;
+      _dryICtrl.text   = (rawDryI > 0 ? rawDryI : 1.5).toString();
+      final rawDryT = (s?['dry_t'] as num?)?.toInt() ?? 0;
+      _dryTCtrl.text   = (rawDryT > 0 ? rawDryT : 8).toString();
       _startTCtrl.text = (s?['start_t'] ?? 300).toString();
+      _uvRstCtrl.text  = (s?['uv_rst']  ?? 300).toString();
       _loading = false;
     });
   }
@@ -1237,6 +1307,7 @@ class _SettingsPageState extends State<SettingsPage> {
           _devStartT = (s['cfg_start_t'] as num?)?.toInt();
           _devHp     = (s['cfg_hp']      as num?)?.toInt();
           _devDryEn  = (s['cfg_dry_en']  as num?)?.toInt();
+          _devUvRst  = (s['cfg_uv_rst_t'] as num?)?.toInt();
         }
       });
     });
@@ -1248,7 +1319,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _pumpId = pump;
       _loading = true;
       _devOv = _devUv = _devPl = _devDryI = null;
-      _devDryT = _devStartT = _devHp = _devDryEn = null;
+      _devDryT = _devStartT = _devHp = _devDryEn = _devUvRst = null;
       _devDryI2 = null;
       _devDryT2 = _devStartT2 = _devHp2 = _devDryEn2 = null;
     });
@@ -1261,16 +1332,20 @@ class _SettingsPageState extends State<SettingsPage> {
     final ov   = double.parse(_ovCtrl.text);
     final uv   = double.parse(_uvCtrl.text);
     final pl   = double.parse(_plCtrl.text);
-    final dryI   = _dryRunEnabled ? double.parse(_dryICtrl.text)   : 0.0;
-    final dryT   = _dryRunEnabled ? int.parse(_dryTCtrl.text)      : 0;
+    // Always save the real threshold values — never zero them out.
+    // Zeroing caused validation failures (Must be > 0) on the next enable.
+    // Firmware ignores dry_i/dry_t when cfg_dry_en=0, so safe to keep values.
+    final dryI   = double.parse(_dryICtrl.text);
+    final dryT   = int.parse(_dryTCtrl.text);
     final startT = int.tryParse(_startTCtrl.text) ?? 90;
+    final uvRst  = int.tryParse(_uvRstCtrl.text)  ?? 0;
 
     setState(() => _saving = true);
     await db.ref(_settingsPath).set({
       // Voltage thresholds only apply to relay1 (shared power meter on site).
       // pump02 (relay2) skips ov/uv/pl — bridge routes to pump/02/settings
       // which firmware handles via apply_settings2().
-      if (!_isRelay2) ...{'ov': ov, 'uv': uv, 'pl': pl},
+      if (!_isRelay2) ...{'ov': ov, 'uv': uv, 'pl': pl, 'uv_rst': uvRst},
       'dry_i': dryI, 'dry_t': dryT, 'start_t': startT,
       'dry_en': _dryRunEnabled ? 1 : 0,
       if (_selectedHp != null) 'hp': _selectedHp,
@@ -1339,13 +1414,6 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  @override
-  void dispose() {
-    _devSub?.cancel();
-    _ovCtrl.dispose(); _uvCtrl.dispose(); _plCtrl.dispose();
-    _dryICtrl.dispose(); _dryTCtrl.dispose(); _startTCtrl.dispose();
-    super.dispose();
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -1380,6 +1448,27 @@ class _SettingsPageState extends State<SettingsPage> {
                               }).toList(),
                               selected: {_pumpId},
                               onSelectionChanged: (s) => _onPumpChanged(s.first),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    // ── Notifications ───────────────────────────────────
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.notifications_outlined, size: 20),
+                            const SizedBox(width: 10),
+                            const Expanded(
+                              child: Text('Push Notifications',
+                                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                            ),
+                            Switch(
+                              value: _notifEnabled,
+                              onChanged: _setNotifEnabled,
                             ),
                           ],
                         ),
@@ -1452,6 +1541,25 @@ class _SettingsPageState extends State<SettingsPage> {
                                   hint: 'e.g. 360'),
                               _field('Phase Loss',    _plCtrl, 'V', _validatePositive,
                                   hint: 'e.g. 200'),
+                              const SizedBox(height: 6),
+                              _field('UV/PL Auto-restart delay', _uvRstCtrl, 's',
+                                  (v) {
+                                    if (v == null || v.isEmpty) return 'Required';
+                                    final n = int.tryParse(v);
+                                    if (n == null || n < 0) return 'Must be 0 or more';
+                                    return null;
+                                  },
+                                  hint: '0 = disabled, e.g. 300'),
+                              const Padding(
+                                padding: EdgeInsets.only(bottom: 4),
+                                child: Text(
+                                  '0 = disabled. When > 0, pump auto-restarts this many seconds after '
+                                  'undervoltage / phase loss clears. 300 s (5 min) recommended — '
+                                  'allows motor to fully de-energise before reconnecting. '
+                                  'Overvoltage never auto-restarts.',
+                                  style: TextStyle(fontSize: 11, color: Colors.grey),
+                                ),
+                              ),
                             ],
                           ),
                         ),
@@ -1572,6 +1680,9 @@ class _SettingsPageState extends State<SettingsPage> {
                                 _deviceRow('Dry I', '${_devDryI?.toStringAsFixed(1)} A'),
                                 _deviceRow('Dry T', '$_devDryT s'),
                               ],
+                              if (_devUvRst != null)
+                                _deviceRow('UV Auto-restart',
+                                    _devUvRst == 0 ? 'Disabled' : '$_devUvRst s'),
                             ],
                           ],
                         ),

@@ -28,6 +28,7 @@
 #include "main.h"
 #include "ota.h"
 #include "lora.h"
+#include "lora_ota.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,8 +42,7 @@ extern const char g_fw_ver[];
 /* ═══════════════════════════════════════════════════════════════════════════
  * USER CONFIG  —  change these two lines per device before flashing
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define PUMP_ID  "01"                /* relay1 ID  — "01" prod, "03" test  */
-#define PUMP_ID2 "02"                /* relay2 ID  — always PUMP_ID + 1    */
+/* PUMP_ID / PUMP_ID2 — defined in modem.h, change there before flashing */
 #define MQTT_USERNAME ""             /* anonymous — broker.emqx.io         */
 #define MQTT_PASSWORD ""
 /* SMS remote-control trusted sender — set to "+91XXXXXXXXXX" to restrict;
@@ -65,7 +65,9 @@ extern const char g_fw_ver[];
 #define TOPIC_OTA        "pump/" PUMP_ID "/ota"
 #define TOPIC_OTA_STATUS "pump/" PUMP_ID "/ota/status"
 #define TOPIC_SETTINGS "pump/" PUMP_ID "/settings"
-#define TOPIC_LOG      "pump/" PUMP_ID "/log"
+#define TOPIC_LOG        "pump/" PUMP_ID "/log"
+#define TOPIC_SLAVE_LOG  "pump/" PUMP_ID "/slave_log"  /* LoRa slave heartbeat log */
+#define TOPIC_LORA_OTA   "pump/" PUMP_ID "/lora_ota"  /* Blue Pill OTA trigger URL */
 /* relay2 — same STM32, topics derived from PUMP_ID2 */
 #define TOPIC_CMD2       "pump/" PUMP_ID2 "/cmd"
 #define TOPIC_STATUS2    "pump/" PUMP_ID2 "/status"
@@ -82,6 +84,7 @@ static int   cfg_dry_t = 8;      /* s  — consecutive seconds before trip   */
 static int   cfg_hp     = 0;     /* pump rating: 5=5HP 75=7.5HP 0=custom   */
 static int   cfg_dry_en  = 1;   /* 1=dry-run enabled  0=disabled           */
 static int   cfg_start_t = 300; /* s  — startup grace: skip dry-run count  */
+static int   cfg_uv_restart_t = 300; /* s — 0=disabled; default 5 min; overridden by MQTT settings */
 /* ── Relay2-specific settings (dry_i/dry_t/dry_en/hp only — voltage shared) */
 static float cfg_dry_i2  = 1.5f; /* A  — dry run threshold for relay2      */
 static int   cfg_dry_t2  = 8;    /* s  — dry run delay for relay2          */
@@ -97,6 +100,7 @@ static int   cfg_start_t2 = 300; /* s  — startup grace for relay2           */
 
 /* ── Heartbeat interval (event-driven: also publish on every state change) ── */
 #define HEARTBEAT_INTERVAL_MS 10000UL   /* publish status every 10 s */
+#define LORA_LOG_INTERVAL_MS  60000UL   /* LoRa heartbeat log every 1 min */
 /* QoS0 PUBEX acks can arrive late when modem/network is busy. */
 #define MQTT_PUBACK_TIMEOUT_MS 12000UL
 #define OTA_POST_QMTCLOSE_DELAY_MS 8000UL
@@ -161,6 +165,10 @@ static bool sms_pending = false; /* +CMTI URC received — read SMS on next proc
 static int  sms_index   = -1;   /* SMS storage index from +CMTI: "SM",<idx>       */
 static bool volt_alert_sent1 = false;    /* voltage fault alert was published for relay1 */
 static bool volt_alert_sent2 = false;    /* voltage fault alert was published for relay2 */
+static bool     uv_pl_tripped1 = false;  /* relay1 was tripped by UV/PL (not OV) — eligible for auto-restart */
+static bool     uv_pl_tripped2 = false;
+static uint32_t uv_cleared_ms1 = 0;     /* HAL_GetTick() when UV/PL first cleared for relay1 */
+static uint32_t uv_cleared_ms2 = 0;
 static bool recv_payload_pending = false; /* true when +QMTRECV payload on next line */
 static char recv_pending_topic[48] = ""; /* topic of pending split-line payload     */
 static uint8_t  dry_run_count   = 0;
@@ -186,6 +194,7 @@ static bool pub_status2_needed = false;
 
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
+static uint32_t lora_log_last_ms   = 0;
 static bool     prev_relay1        = false;
 static bool     prev_relay2        = false;
 static bool     prev_dry_run_trip  = false;
@@ -481,10 +490,14 @@ static void publish_status(void)
     bool r1_running = relay1 && data_ok && (i > cfg_dry_i);
     bool r2_running = relay2 && data_ok && (i > cfg_dry_i2); /* relay2 uses its own threshold */
 
-    char payload[660];
+    int r3 = LoRa_GetRelay3State();  /* -1=unknown, 0=OFF, 1=ON */
+    int r4 = LoRa_GetRelay4State();
+
+    char payload[720];
     snprintf(payload, sizeof(payload),
              "{\"relay1_state\":%d,\"relay2_state\":%d,"
              "\"relay1_running\":%d,\"relay2_running\":%d,"
+             "\"relay3_state\":%d,\"relay4_state\":%d,"
              "\"v1\":%s,\"v2\":%s,\"v3\":%s,"
              "\"current\":%s,\"kw\":%s,"
              "\"dry_run\":%s,\"dry_run2\":%s,\"online\":true,"
@@ -492,11 +505,13 @@ static void publish_status(void)
              "\"fw\":\"%s\","
              "\"cfg_ov\":%s,\"cfg_uv\":%s,\"cfg_pl\":%s,"
              "\"cfg_dry_i\":%s,\"cfg_dry_t\":%d,\"cfg_start_t\":%d,\"cfg_hp\":%d,\"cfg_dry_en\":%d,"
-             "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d}",
+             "\"cfg_dry_i2\":%s,\"cfg_dry_t2\":%d,\"cfg_start_t2\":%d,\"cfg_hp2\":%d,\"cfg_dry_en2\":%d,"
+             "\"cfg_uv_rst_t\":%d}",
              relay1 ? 1 : 0,
              relay2 ? 1 : 0,
              r1_running ? 1 : 0,
              r2_running ? 1 : 0,
+             r3, r4,
              sv1, sv2, sv3, sci, skw,
              dry_run_tripped  ? "true" : "false",
              dry_run_tripped2 ? "true" : "false",
@@ -507,7 +522,8 @@ static void publish_status(void)
              g_fw_ver,
              scfg_ov, scfg_uv, scfg_pl,
              scfg_dry_i, cfg_dry_t, cfg_start_t, cfg_hp, cfg_dry_en,
-             scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2);
+             scfg_dry_i2, cfg_dry_t2, cfg_start_t2, cfg_hp2, cfg_dry_en2,
+             cfg_uv_restart_t);
 
     queue_publish(TOPIC_STATUS, payload);
 }
@@ -639,6 +655,8 @@ static void run_protection(void)
     if (volt_trip1 && relay1)
     {
         Relay1_Set(false);
+        /* Mark UV/PL trip for auto-restart — OV is dangerous, never auto-restart */
+        if (!ov) { uv_pl_tripped1 = true; uv_cleared_ms1 = 0; }
         log_relay_event(1, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
         publish_alert(ov, uv, pl, false);
         volt_alert_sent1 = true;
@@ -648,16 +666,24 @@ static void run_protection(void)
     if (volt_trip2 && relay2)
     {
         Relay2_Set(false);
+        if (!ov) { uv_pl_tripped2 = true; uv_cleared_ms2 = 0; }
         log_relay_event(2, false, ov ? "overvoltage" : (uv ? "undervoltage" : "phase_loss"));
         publish_alert2(ov, uv, pl, false);
         volt_alert_sent2 = true;
         Debug_Print("[PROT] Voltage fault — pump2 OFF\r\n");
     }
 
+    /* If UV/PL dips again while we're waiting to auto-restart, reset the
+     * recovery timer so the N-second count restarts from the next clear. */
+    if ((uv || pl) && !ov) {
+        if (uv_pl_tripped1 && uv_cleared_ms1) { uv_cleared_ms1 = 0; }
+        if (uv_pl_tripped2 && uv_cleared_ms2) { uv_cleared_ms2 = 0; }
+    }
+
     if ((ov || uv || pl) && (relay1 || relay2))
         return;
 
-    /* Voltage OK — clear any outstanding voltage fault alert in Firebase */
+    /* Voltage OK — clear alerts and handle UV/PL auto-restart */
     if (!ov && !uv && !pl)
     {
         if (volt_alert_sent1) {
@@ -669,6 +695,49 @@ static void run_protection(void)
             volt_alert_sent2 = false;
             publish_alert2(false, false, false, false);
             Debug_Print("[PROT] Voltage fault cleared — pump2 alert reset\r\n");
+        }
+
+        /* ── UV/PL auto-restart ─────────────────────────────────────────────
+         * If relay was tripped by UV/PL (not OV) and cfg_uv_restart_t > 0,
+         * wait N seconds after voltage recovers then restart automatically. */
+        if (uv_pl_tripped1) {
+            if (relay1) {
+                /* Relay was manually restarted — cancel auto-restart */
+                uv_pl_tripped1 = false; uv_cleared_ms1 = 0;
+            } else if (cfg_uv_restart_t > 0) {
+                if (uv_cleared_ms1 == 0) {
+                    uv_cleared_ms1 = HAL_GetTick();
+                    Debug_Print("[PROT] UV/PL cleared — auto-restart timer started\r\n");
+                } else if (!dry_run_tripped &&
+                           HAL_GetTick() - uv_cleared_ms1 >= (uint32_t)cfg_uv_restart_t * 1000U) {
+                    uv_pl_tripped1 = false; uv_cleared_ms1 = 0;
+                    Relay1_Set(true);
+                    log_relay_event(1, true, "uv_restart");
+                    Debug_Print("[PROT] UV/PL auto-restart — pump1 ON\r\n");
+                }
+            } else {
+                /* Auto-restart disabled — clear flag so it doesn't linger */
+                uv_pl_tripped1 = false; uv_cleared_ms1 = 0;
+            }
+        }
+
+        if (uv_pl_tripped2) {
+            if (relay2) {
+                uv_pl_tripped2 = false; uv_cleared_ms2 = 0;
+            } else if (cfg_uv_restart_t > 0) {
+                if (uv_cleared_ms2 == 0) {
+                    uv_cleared_ms2 = HAL_GetTick();
+                    Debug_Print("[PROT] UV/PL cleared — auto-restart timer started (pump2)\r\n");
+                } else if (!dry_run_tripped2 &&
+                           HAL_GetTick() - uv_cleared_ms2 >= (uint32_t)cfg_uv_restart_t * 1000U) {
+                    uv_pl_tripped2 = false; uv_cleared_ms2 = 0;
+                    Relay2_Set(true);
+                    log_relay_event(2, true, "uv_restart");
+                    Debug_Print("[PROT] UV/PL auto-restart — pump2 ON\r\n");
+                }
+            } else {
+                uv_pl_tripped2 = false; uv_cleared_ms2 = 0;
+            }
         }
     }
 
@@ -884,6 +953,7 @@ static bool extract_ota_url_any(const char *text, char *out, size_t max)
 
 static void modem_ota_start(const char *url); /* forward declaration */
 static void modem_ota_publish(const char *topic, const char *payload); /* forward declaration */
+static void modem_lora_ota_publish(const char *topic, const char *payload); /* forward declaration */
 static bool modem_is_exact_reboot_urc(const char *line);
 
 /* ── Relay state persistence (Flash page 31 = 0x0800F800, 2KB) ──────────────
@@ -985,6 +1055,7 @@ static void apply_settings(const char *json)
     t = extract_int(json, "hp");                 if (t > 0)    cfg_hp     = t;
     if (strstr(json, "\"dry_en\":"))             cfg_dry_en = extract_int(json, "dry_en") ? 1 : 0;
     t = extract_int(json, "start_t");            if (t > 0)    cfg_start_t = t;
+    if (strstr(json, "\"uv_rst\":"))            { t = extract_int(json, "uv_rst"); if (t >= 0) cfg_uv_restart_t = t; }
     Debug_Print("[CFG] Settings updated\r\n");
     publish_status(); /* reflect new cfg_ values immediately — don't wait for next heartbeat */
 }
@@ -1266,6 +1337,14 @@ static void process_line(const char *line)
         return;
     }
 
+    /* Forward all lines to LoRa OTA state machine during active LoRa OTA.
+     * LoRaOta_HandleLine() handles HTTPS/file URCs and LoRa ACK responses. */
+    if (LoRaOta_IsActive())
+    {
+        LoRaOta_HandleLine(line);
+        return;
+    }
+
     /* +QMTRECV: incoming command — handle in ANY state that has an active
      * MQTT session so relay commands work even during PUBLISHING/PUB_WAIT_OK.
      * Some EC200U firmware versions put the JSON payload on the SAME line:
@@ -1331,6 +1410,16 @@ static void process_line(const char *line)
                         publish_status2();
                     }
                 }
+                return;
+            }
+            /* LoRa OTA trigger: {"url":"https://..."} on lora_ota topic */
+            if (strstr(recv_pending_topic, TOPIC_LORA_OTA) ||
+                strstr(line, TOPIC_LORA_OTA))
+            {
+                char lora_url[200];
+                recv_pending_topic[0] = '\0';
+                if (extract_str(json, "url", lora_url, sizeof(lora_url)))
+                    LoRaOta_Start(lora_url);
                 return;
             }
             /* OTA command: {"url":"https://..."} */
@@ -1411,6 +1500,14 @@ static void process_line(const char *line)
             if (strstr(line, TOPIC_SETTINGS2))
             {
                 apply_settings2(json);
+                return;
+            }
+            /* LoRa OTA trigger inline: {"url":"https://..."} on lora_ota topic */
+            if (strstr(line, TOPIC_LORA_OTA))
+            {
+                char lora_url[200];
+                if (extract_str(json, "url", lora_url, sizeof(lora_url)))
+                    LoRaOta_Start(lora_url);
                 return;
             }
             /* OTA command: {"url":"https://..."} */
@@ -1843,8 +1940,16 @@ static void process_line(const char *line)
         }
         if (strstr(line, "+QMTSUB: 0,5,0"))
         {
-            /* pump02/settings subscribed — fully connected now */
-            Debug_Print("[MQTT] Subscribed to " TOPIC_SETTINGS2 "\r\n");
+            /* pump02/settings subscribed — subscribe to lora_ota topic */
+            Debug_Print("[MQTT] Subscribed to " TOPIC_SETTINGS2 " — subscribing lora_ota...\r\n");
+            char sub_cmd[64];
+            snprintf(sub_cmd, sizeof(sub_cmd), "AT+QMTSUB=0,6,\"%s\",1", TOPIC_LORA_OTA);
+            modem_cmd(sub_cmd);
+        }
+        if (strstr(line, "+QMTSUB: 0,6,0"))
+        {
+            /* lora_ota topic subscribed — fully connected now */
+            Debug_Print("[MQTT] Subscribed to " TOPIC_LORA_OTA "\r\n");
             blink_n(3); /* 3 blinks = MQTT fully connected! */
             HAL_IWDG_Refresh(&hiwdg);
 
@@ -2293,6 +2398,13 @@ static void modem_ota_publish(const char *topic, const char *payload)
     queue_publish(TOPIC_OTA_STATUS, payload);
 }
 
+/* ── LoRa OTA publish callback — lets lora_ota.c publish via MQTT ──────── */
+static void modem_lora_ota_publish(const char *topic, const char *payload)
+{
+    pub_pending = false;
+    queue_publish(topic, payload);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Modem_Init  — called once from main.c after UART init
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -2469,6 +2581,12 @@ void Modem_Init(UART_HandleTypeDef *huart)
     OTA_SetSendFn(Modem_Send);
     OTA_SetPublishFn(modem_ota_publish);
 
+    /* Wire up LoRa OTA callbacks (pump03 Blue Pill firmware update over LoRa) */
+    LoRaOta_Init();
+    LoRaOta_SetSendFn(Modem_Send);
+    LoRaOta_SetPublishFn(modem_lora_ota_publish);
+    LoRaOta_SetLoRaFn(LoRa_SendRaw);
+
     /* PDP is now deactivated (modem_sync_expect confirmed OK above).
      * Use the same NET_WAIT path for both cold boot and OTA reboot.
      * NET_WAIT polls CEREG until LTE is registered, then NET_WAIT→PDP_OPEN
@@ -2550,6 +2668,12 @@ void Modem_Process(void)
             continue;
         }
 
+        /* LoRa OTA binary passthrough — raw bytes from AT+QFREAD during LoRa OTA */
+        if (LoRaOta_BinaryPending()) {
+            LoRaOta_FeedByte(c);
+            continue;
+        }
+
         if (c == '\r')
             continue;
 
@@ -2590,7 +2714,7 @@ void Modem_Process(void)
 
     /* Full modem reset recovery path: re-run Modem_Init so SSL/MQTT config
      * is restored before attempting any reconnect. */
-    if (modem_reinit_pending && !OTA_IsActive()) {
+    if (modem_reinit_pending && !OTA_IsActive() && !LoRaOta_IsActive()) {
         modem_reinit_pending   = false;
         recv_payload_pending   = false;
         pub_pending            = false;
@@ -2660,7 +2784,7 @@ void Modem_Process(void)
     }
 
     /* ── periodic tasks (only when fully connected) ── */
-    if (mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive())
+    if (mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive() && !LoRaOta_IsActive())
     {
 
         /* Network time sync — request AT+CCLK? once after connect, then every 6h */
@@ -2701,6 +2825,33 @@ void Modem_Process(void)
             pub_status2_needed = true; /* deferred — queue busy after publish_status() */
         }
 
+        /* LoRa heartbeat log every 60 s */
+        if (HAL_GetTick() - lora_log_last_ms >= LORA_LOG_INTERVAL_MS)
+        {
+            lora_log_last_ms = HAL_GetTick();
+            uint64_t ts = Modem_GetUnixMs();
+            uint32_t age_s = LoRa_GetLastRcvAge();
+            if (age_s == 0xFFFFFFFFUL) age_s = 0;
+            else                        age_s /= 1000;
+            char lora_log[128];
+            if (ts)
+                snprintf(lora_log, sizeof(lora_log),
+                         "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
+                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,\"ts\":%llu}",
+                         LoRa_GetRelay3State(), LoRa_GetRelay4State(),
+                         LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
+                         (unsigned long)age_s,
+                         (unsigned long long)ts);
+            else
+                snprintf(lora_log, sizeof(lora_log),
+                         "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
+                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu}",
+                         LoRa_GetRelay3State(), LoRa_GetRelay4State(),
+                         LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
+                         (unsigned long)age_s);
+            queue_publish(TOPIC_SLAVE_LOG, lora_log);
+        }
+
         /* run protection every 1 s */
         static uint32_t last_prot_ms = 0;
         if (HAL_GetTick() - last_prot_ms >= 1000)
@@ -2733,7 +2884,7 @@ void Modem_Process(void)
     HAL_IWDG_Refresh(&hiwdg);
 
     /* ── send queued publish when connected and idle (not during OTA) ── */
-    if (pub_pending && mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive())
+    if (pub_pending && mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive() && !LoRaOta_IsActive())
     {
         char pub_cmd[128];
         snprintf(pub_cmd, sizeof(pub_cmd),
@@ -2745,7 +2896,7 @@ void Modem_Process(void)
     }
 
     /* ── auto-reconnect (not during OTA — would disrupt HTTP download) ── */
-    if (mqtt_state == MQTT_STATE_DISCONNECTED && !OTA_IsActive())
+    if (mqtt_state == MQTT_STATE_DISCONNECTED && !OTA_IsActive() && !LoRaOta_IsActive())
     {
         static uint32_t last_reconnect = 0;
         if (HAL_GetTick() - last_reconnect > 10000)

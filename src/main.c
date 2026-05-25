@@ -22,12 +22,13 @@
 #include "modbus.h"
 #include "ota.h"
 #include "lora.h"
+#include "lora_ota.h"
 #include <string.h>
 #include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#define FW_VER "2026-05-21"
+#define FW_VER "2026-05-25"
 const char g_fw_ver[] = FW_VER;
 extern volatile uint32_t g_reset_reason_magic;
 extern volatile uint32_t g_hf_pc;
@@ -86,7 +87,7 @@ static void MX_IWDG_Init(void);
 #ifdef HAL_ADC_MODULE_ENABLED
 static void MX_ADC1_Init(void);
 #endif
-/* USER CODE BEGIN PFP */
+/* USER CODE BEGIN . */
 
 /* USER CODE END PFP */
 
@@ -190,6 +191,7 @@ int main(void)
       Modbus_Process();
     }
     OTA_Process();
+    LoRaOta_Process();
     /* Diagnostic heartbeat: toggle PA8 (DE485) every 500ms to confirm MCU alive. */
     if ((HAL_GetTick() - g_hb_last_ms) >= 500U) {
       g_hb_last_ms = HAL_GetTick();

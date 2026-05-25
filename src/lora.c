@@ -8,11 +8,12 @@
  *
  * Replies received from slave:
  *   P1:ON OK   P1:OFF OK   P2:ON OK   P2:OFF OK
- *   S:R1:ON,R2:OFF
+ *   S:R1:ON|R2:OFF
  *   ERR:UNKNOWN CMD
  */
 
 #include "lora.h"
+#include "lora_ota.h"
 #include "main.h"
 #include <string.h>
 #include <stdio.h>
@@ -31,6 +32,15 @@ static UART_HandleTypeDef *lora_uart = NULL;
 #define LORA_LINE_MAX 160
 static char     lora_line[LORA_LINE_MAX];
 static uint16_t lora_pos = 0;
+
+/* slave relay states — updated whenever a heartbeat/ack arrives */
+static int lora_relay3_state = -1;  /* -1 = unknown, 0 = OFF, 1 = ON */
+static int lora_relay4_state = -1;
+
+/* last received +RCV signal quality */
+static int      lora_last_rssi     = 0;
+static int      lora_last_snr      = 0;
+static uint32_t lora_last_rcv_tick = 0; /* HAL_GetTick() of last +RCV */
 
 /* ─── helpers ───────────────────────────────────────────────────────────── */
 
@@ -73,6 +83,70 @@ static void lora_poll(uint32_t timeout_ms)
         {
             lora_line[lora_pos++] = (char)b;
         }
+    }
+}
+
+/* ─── RCV parser ─────────────────────────────────────────────────────────
+ * Handles +RCV=<addr>,<len>,<data>,<RSSI>,<SNR>
+ * Parses slave heartbeat/ack: S:R1:ON|R2:OFF  or  P1:ON OK  etc.
+ * ────────────────────────────────────────────────────────────────────── */
+static void lora_process_rcv(const char *line)
+{
+    /* skip "+RCV=" prefix */
+    const char *p = line + 5;
+
+    /* skip addr field */
+    p = strchr(p, ','); if (!p) return; p++;
+    /* skip len field */
+    p = strchr(p, ','); if (!p) return; p++;
+    /* p now points to data — no commas inside relay/OTA messages */
+    char data[160] = "";
+    size_t i = 0;
+    while (*p && *p != ',' && i < sizeof(data) - 1)
+        data[i++] = *p++;
+    data[i] = '\0';
+
+    /* extract RSSI (4th field) and SNR (5th field) */
+    if (*p == ',') { p++; lora_last_rssi = (int)strtol(p, NULL, 10); }
+    p = strchr(p, ',');
+    if (p)          { p++; lora_last_snr  = (int)strtol(p, NULL, 10); }
+    lora_last_rcv_tick = HAL_GetTick();
+
+    char dbg[80];
+    snprintf(dbg, sizeof(dbg), "[LoRa] slave: %.63s\r\n", data);
+    Debug_Print(dbg);
+
+    /* Route OTA protocol responses to lora_ota state machine */
+    if (strncmp(data, "OTA:", 4) == 0) {
+        LoRaOta_HandleResponse(data);
+        return;
+    }
+
+    /* Parse status heartbeat: S:R1:ON|R2:OFF */
+    if (strncmp(data, "S:R1:", 5) == 0)
+    {
+        lora_relay3_state = (strncmp(data + 5, "ON", 2) == 0) ? 1 : 0;
+
+        const char *r2 = strstr(data, "R2:");
+        if (r2)
+            lora_relay4_state = (strncmp(r2 + 3, "ON", 2) == 0) ? 1 : 0;
+
+        snprintf(dbg, sizeof(dbg), "[LoRa] HB relay3=%d relay4=%d\r\n",
+                 lora_relay3_state, lora_relay4_state);
+        Debug_Print(dbg);
+        return;
+    }
+
+    /* Parse ack: P1:ON OK or P1:OFF OK */
+    if (strncmp(data, "P1:", 3) == 0)
+    {
+        lora_relay3_state = (strncmp(data + 3, "ON", 2) == 0) ? 1 : 0;
+        return;
+    }
+    if (strncmp(data, "P2:", 3) == 0)
+    {
+        lora_relay4_state = (strncmp(data + 3, "ON", 2) == 0) ? 1 : 0;
+        return;
     }
 }
 
@@ -147,6 +221,9 @@ void LoRa_Process(void)
                 char dbg[LORA_LINE_MAX + 16];
                 snprintf(dbg, sizeof(dbg), "[LoRa] RX: %s\r\n", lora_line);
                 Debug_Print(dbg);
+
+                if (strncmp(lora_line, "+RCV=", 5) == 0)
+                    lora_process_rcv(lora_line);
             }
             lora_pos = 0;
         }
@@ -155,4 +232,24 @@ void LoRa_Process(void)
             lora_line[lora_pos++] = (char)b;
         }
     }
+}
+
+/* Send an arbitrary message to the slave (used by lora_ota.c for OTA protocol) */
+void LoRa_SendRaw(const char *msg)
+{
+    if (!lora_uart) return;
+    char cmd[200];  /* OTA:D:nnnn:<128hex>:<crc16> = 144 chars + AT+SEND header */
+    snprintf(cmd, sizeof(cmd), "AT+SEND=%s,%d,%s", LORA_SLAVE_ADDR, (int)strlen(msg), msg);
+    lora_send_cmd(cmd);
+}
+
+int      LoRa_GetRelay3State(void)  { return lora_relay3_state; }
+int      LoRa_GetRelay4State(void)  { return lora_relay4_state; }
+int      LoRa_GetLastRSSI(void)     { return lora_last_rssi; }
+int      LoRa_GetLastSNR(void)      { return lora_last_snr; }
+/* Returns ms since last +RCV, or 0xFFFFFFFF if never received */
+uint32_t LoRa_GetLastRcvAge(void)
+{
+    if (lora_last_rcv_tick == 0) return 0xFFFFFFFFUL;
+    return HAL_GetTick() - lora_last_rcv_tick;
 }

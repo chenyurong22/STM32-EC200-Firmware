@@ -1,7 +1,7 @@
 // lib/logs_page.dart
 // Pump logs — Events tab (history list) + Charts tab (3 charts)
 // Charts data sources:
-//   pumps/{pumpId}/voltage_log/{key}: {ts, v1, v2, v3, current}  (15-min snapshots)
+//   pumps/{pumpId}/voltage_log/{key}: {ts, v1, v2, v3, current}  (5-min snapshots)
 //   pumps/{pumpId}/logs/{key}:        {event, reason, run_s, ts}
 
 import 'package:flutter/material.dart';
@@ -123,11 +123,11 @@ class _LogsPageState extends State<LogsPage>
     final winEndMs  = _windowStartMs + 24 * 3600 * 1000;
 
     final chartPump = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
-    // limitToLast(500) covers up to 5 days of 15-min slots; filter client-side
+    // limitToLast(1500) covers up to 5 days of 5-min slots; filter client-side
     final snap = await _db
         .ref('pumps/$chartPump/voltage_log')
         .orderByKey()
-        .limitToLast(500)
+        .limitToLast(1500)
         .get();
     final data = snap.value as Map?;
     if (data == null) { _vlog = []; return; }
@@ -144,7 +144,7 @@ class _LogsPageState extends State<LogsPage>
     final snap = await _db
         .ref('pumps/$deviceId/voltage_log')
         .orderByKey()
-        .limitToLast(700) // ~7 days × 96 slots/day
+        .limitToLast(2016) // ~7 days × 288 slots/day (5-min interval)
         .get();
     final data = snap.value as Map?;
     final List<_VEntry> all = [];
@@ -180,10 +180,22 @@ class _LogsPageState extends State<LogsPage>
         final ts   = (entry['ts']   as num?)?.toInt() ?? 0;
         final runS = (entry['run_s'] as num?)?.toInt() ?? 0;
         if (ev != 'off' || ts < cutoffMs || runS <= 0) continue;
-        final dt    = DateTime.fromMillisecondsSinceEpoch(ts).toLocal();
-        final label = '${dt.day.toString().padLeft(2, '0')}/'
-                      '${dt.month.toString().padLeft(2, '0')}';
-        dayMap[label] = (dayMap[label] ?? 0) + runS;
+        // Split runtime across calendar days using the actual start time.
+        // e.g. pump ran 2h45m ending at 02:00 today → 1h attributerd to
+        // yesterday, 2h to today. Uses midnight boundaries.
+        final startMs = ts - runS * 1000;
+        var   curMs   = startMs;
+        while (curMs < ts) {
+          final curDt      = DateTime.fromMillisecondsSinceEpoch(curMs).toLocal();
+          final nextMidMs  = DateTime(curDt.year, curDt.month, curDt.day + 1)
+                                 .millisecondsSinceEpoch;
+          final segEndMs   = ts < nextMidMs ? ts : nextMidMs;
+          final segSecs    = ((segEndMs - curMs) / 1000).round();
+          final label      = '${curDt.day.toString().padLeft(2, '0')}/'
+                             '${curDt.month.toString().padLeft(2, '0')}';
+          dayMap[label] = (dayMap[label] ?? 0) + segSecs;
+          curMs = segEndMs;
+        }
       }
       result[pumpId] = dayMap;
     }));
@@ -559,12 +571,12 @@ class _LogsPageState extends State<LogsPage>
     return peak;
   }
 
-  // Total kWh for a 24-h window: kW × 0.25 h per 15-min slot
+  // Total kWh for a 24-h window: kW × (5/60) h per 5-min slot
   double _windowKwhTotal(int winStartMs) {
     final winEndMs = winStartMs + 24 * 3600 * 1000;
     double total = 0;
     for (final e in _allVlog) {
-      if (e.ts >= winStartMs && e.ts < winEndMs) total += e.kw * 0.25;
+      if (e.ts >= winStartMs && e.ts < winEndMs) total += e.kw / 12.0;
     }
     return total;
   }

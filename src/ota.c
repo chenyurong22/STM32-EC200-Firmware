@@ -4,6 +4,7 @@
 
 #include "ota.h"
 #include "main.h"
+#include "modem.h"
 #include "stm32g0xx_hal.h"
 #include <string.h>
 #include <stdlib.h>
@@ -13,8 +14,8 @@
 extern IWDG_HandleTypeDef hiwdg;
 
 /* Config */
+#define OTA_STATUS_TOPIC            "pump/" PUMP_ID "/ota/status"
 #define OTA_CHUNK_SIZE              256U
-#define OTA_STATUS_TOPIC            "pump/01/ota/status"
 #define OTA_PROGRESS_EVERY          4096U
 #define OTA_CMD_TIMEOUT_MS          120000UL
 #define OTA_READ_TIMEOUT_MS         45000UL
