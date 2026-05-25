@@ -2047,7 +2047,7 @@ static bool modem_sync_expect(const char *expected, uint32_t timeout_ms)
     uint32_t t0   = HAL_GetTick();
     modem_last_resp[0] = '\0';
     while (HAL_GetTick() - t0 < timeout_ms) {
-        HAL_IWDG_Refresh(&hiwdg);
+        IWDG->KR = 0xAAAAU;  /* direct kick — hiwdg.Instance is NULL before MX_IWDG_Init */
         uint8_t c;
         if (HAL_UART_Receive(modem_uart, &c, 1, 1) != HAL_OK) continue;
         if (c == '\r') continue;
@@ -2078,7 +2078,7 @@ static bool modem_sync_cmd_ok(const char *cmd, uint32_t timeout_ms, uint8_t retr
         if (modem_sync_expect("OK", timeout_ms))
             return true;
         HAL_Delay(300);
-        HAL_IWDG_Refresh(&hiwdg);
+        IWDG->KR = 0xAAAAU;  /* direct kick — safe before MX_IWDG_Init */
     }
     return false;
 }
@@ -2477,8 +2477,26 @@ void Modem_Init(UART_HandleTypeDef *huart)
         IWDG->KR = 0xAAAAU;
         Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
     } else {
-        /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
+        /* Cold boot / STM32-only reset — EC200U powers on, takes ~5 s. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        /* If the modem was already running when the STM32 reset (IWDG trip,
+         * brownout, manual reset), its TLS heap may still hold a previous
+         * MQTT SSL allocation.  AT+QMTOPEN then fails silently because it
+         * cannot allocate SSL buffers — same root cause as post-OTA.
+         * Probe with AT: if the modem responds it was already up, so issue
+         * CFUN=1,1 to flush all TLS state.  If it doesn't respond it is
+         * still booting from a true cold start and needs no flush.       */
+        if (modem_sync_cmd_ok("AT", 1000, 3)) {
+            Debug_Print("[MODEM] Modem already up — CFUN=1,1 to clear TLS heap\r\n");
+            modem_cmd("AT+CFUN=1,1");
+            bool rdy2 = modem_sync_expect("RDY", 30000);
+            (void)rdy2;
+            /* 10 s additional settle: SIM CPIN, partial network registration */
+            for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+            { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
+            IWDG->KR = 0xAAAAU;
+            Debug_Print("[MODEM] Cold-boot CFUN reset + settle complete\r\n");
+        }
     }
     if (!modem_sync_cmd_ok("AT", 2000, 15))
         Debug_Print("[MODEM] WARN: AT sync failed, continuing\r\n");
