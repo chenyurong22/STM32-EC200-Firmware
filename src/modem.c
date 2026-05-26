@@ -2180,6 +2180,29 @@ static void modem_ota_start(const char *url)
             HAL_Delay(500);        /* wait for modem to process publish */
             /* Flush +QMTPUBEX response so it doesn't interfere with SSL cmds */
             { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
+
+            /* Self-clear the retained OTA message on pump/XX/ota so the
+             * device does NOT re-trigger OTA on the next reconnect even if
+             * the bridge misses the "starting" status.
+             * Publish empty payload + retain=1 → broker deletes the retained. */
+            char clr_cmd[80];
+            snprintf(clr_cmd, sizeof(clr_cmd),
+                     "AT+QMTPUBEX=0,0,1,1,\"%s\",0", TOPIC_OTA);
+            modem_cmd(clr_cmd);
+            bool clr_prompt = false;
+            t0 = HAL_GetTick();
+            while (HAL_GetTick() - t0 < 3000) {
+                if (HAL_UART_Receive(modem_uart, &c, 1, 5) == HAL_OK && c == '>') {
+                    clr_prompt = true; break;
+                }
+            }
+            if (clr_prompt) {
+                ctrlz = 0x1A;
+                HAL_UART_Transmit(modem_uart, &ctrlz, 1, 500); /* 0-byte payload */
+                HAL_Delay(300);
+                { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
+                Debug_Print("[OTA] Retained OTA topic self-cleared\r\n");
+            }
         }
         HAL_IWDG_Refresh(&hiwdg);
     }
