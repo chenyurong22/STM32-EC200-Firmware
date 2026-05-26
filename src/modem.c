@@ -2184,10 +2184,12 @@ static void modem_ota_start(const char *url)
             /* Self-clear the retained OTA message on pump/XX/ota so the
              * device does NOT re-trigger OTA on the next reconnect even if
              * the bridge misses the "starting" status.
-             * Publish empty payload + retain=1 → broker deletes the retained. */
+             * Publish empty payload + retain=1 → broker deletes the retained.
+             * NOTE: msgid MUST be 0 when qos=0 (EC200U rejects qos=1,msgid=0
+             * with ERROR and never shows the > prompt — silent failure). */
             char clr_cmd[80];
             snprintf(clr_cmd, sizeof(clr_cmd),
-                     "AT+QMTPUBEX=0,0,1,1,\"%s\",0", TOPIC_OTA);
+                     "AT+QMTPUBEX=0,0,0,1,\"%s\",0", TOPIC_OTA);
             modem_cmd(clr_cmd);
             bool clr_prompt = false;
             t0 = HAL_GetTick();
@@ -2463,6 +2465,14 @@ void Modem_Init(UART_HandleTypeDef *huart)
     RCC->CSR |= RCC_CSR_RMVF;   /* clear reset-cause flags for next check */
 
     if (ota_reboot) {
+        /* Block OTA retrigger for 2 minutes after an OTA reboot.
+         * Prevents the retained pump/XX/ota MQTT message from triggering
+         * an immediate second OTA before the broker clears the retained copy.
+         * Set early (HAL_GetTick() ≈ 0 at this point) so the block expires
+         * ~120 s from boot — well after MQTT reconnects (~60-80 s). */
+        ota_retry_block_until = HAL_GetTick() + 120000UL;
+        Debug_Print("[OTA] Cooldown armed (2 min) to prevent post-OTA loop\r\n");
+
         /* Check OTA flags to determine if the bootloader applied the update.
          * Bootloader erases the flags page (all bytes → 0xFF) after a
          * successful App B → App A copy.  If the flags magic is still
