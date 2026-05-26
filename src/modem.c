@@ -2466,13 +2466,13 @@ void Modem_Init(UART_HandleTypeDef *huart)
     RCC->CSR |= RCC_CSR_RMVF;   /* clear reset-cause flags for next check */
 
     if (ota_reboot) {
-        /* Block OTA retrigger for 2 minutes after an OTA reboot.
-         * Prevents the retained pump/XX/ota MQTT message from triggering
-         * an immediate second OTA before the broker clears the retained copy.
-         * Set early (HAL_GetTick() ≈ 0 at this point) so the block expires
-         * ~120 s from boot — well after MQTT reconnects (~60-80 s). */
-        ota_retry_block_until = HAL_GetTick() + 120000UL;
-        Debug_Print("[OTA] Cooldown armed (2 min) to prevent post-OTA loop\r\n");
+        /* Block OTA retrigger for 5 minutes after an OTA reboot.
+         * After ota_reboot, CFUN=1,1 + settle + MQTT connect takes ~3 min.
+         * The previous 2-min cooldown expired BEFORE MQTT even connected,
+         * so the retained OTA URL triggered an instant re-OTA loop every time.
+         * 5 min guarantees the cooldown outlasts MQTT reconnection. */
+        ota_retry_block_until = HAL_GetTick() + 300000UL;
+        Debug_Print("[OTA] Cooldown armed (5 min) to prevent post-OTA loop\r\n");
 
         /* Check OTA flags to determine if the bootloader applied the update.
          * Bootloader erases the flags page (all bytes → 0xFF) after a
