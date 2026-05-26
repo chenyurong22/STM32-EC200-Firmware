@@ -196,6 +196,7 @@ static bool pub_status2_needed = false;
 static uint32_t last_heartbeat_ms  = 0;
 static uint32_t lora_log_last_ms   = 0;
 static uint32_t mqtt_connected_last_ms = 0; /* HAL_GetTick() of last MQTT_STATE_CONNECTED tick */
+static uint32_t modem_boot_ms         = 0; /* HAL_GetTick() when Modem_Init() finished        */
 static bool     prev_relay1        = false;
 static bool     prev_relay2        = false;
 static bool     prev_dry_run_trip  = false;
@@ -2649,6 +2650,7 @@ void Modem_Init(UART_HandleTypeDef *huart)
      * (APP RDY, +CFUN: 1) that arrive during the config phase must not
      * re-trigger a full Modem_Init unnecessarily.                       */
     modem_init_grace_until = HAL_GetTick() + 20000UL;
+    modem_boot_ms = HAL_GetTick();   /* start the never-connected watchdog clock */
     modem_cmd("AT+CEREG?");
 }
 
@@ -2832,16 +2834,25 @@ void Modem_Process(void)
         mqtt_state = MQTT_STATE_CONNECTED;
     }
 
-    /* ── MQTT connectivity watchdog — reset if disconnected > 5 min ── */
+    /* ── MQTT connectivity watchdog ─────────────────────────────────────
+     * Fires if MQTT has not been connected for > 5 min, measured from
+     * whichever is later: last successful connect OR boot completion.
+     * Covers two cases:
+     *   1. Was connected, then dropped (mqtt_connected_last_ms set).
+     *   2. Never connected at all this boot (e.g. TLS heap stuck after
+     *      OTA failure) — use modem_boot_ms as fallback reference so the
+     *      watchdog still fires and CFUN=1,1 clears the stale TLS state. */
     if (mqtt_state == MQTT_STATE_CONNECTED)
         mqtt_connected_last_ms = HAL_GetTick();
-    else if (mqtt_connected_last_ms &&
-             HAL_GetTick() - mqtt_connected_last_ms > 300000UL &&
-             !OTA_IsActive() && !LoRaOta_IsActive())
+    else if (!OTA_IsActive() && !LoRaOta_IsActive())
     {
-        Debug_Print("[MQTT] Disconnected > 5 min — auto reset\r\n");
-        HAL_Delay(200);
-        NVIC_SystemReset();
+        uint32_t ref = mqtt_connected_last_ms ? mqtt_connected_last_ms : modem_boot_ms;
+        if (ref && (HAL_GetTick() - ref) > 300000UL)
+        {
+            Debug_Print("[MQTT] No connection for 5 min — auto reset\r\n");
+            HAL_Delay(200);
+            NVIC_SystemReset();
+        }
     }
 
     /* ── periodic tasks (only when fully connected) ── */
