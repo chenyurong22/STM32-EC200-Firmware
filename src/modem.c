@@ -2210,6 +2210,13 @@ static void modem_ota_start(const char *url)
         HAL_IWDG_Refresh(&hiwdg);
     }
 
+    /* Arm OTA cooldown NOW — before phase 2 CFUN — so that if phase 2 fails
+     * and MQTT reconnects, the retained URL cannot re-trigger OTA immediately.
+     * Without this, any early phase-2 failure caused an instant retry loop:
+     * MQTT reconnect → retained URL → modem_ota_start → CFUN → fail → repeat. */
+    ota_retry_block_until = HAL_GetTick() + OTA_RETRY_BLOCK_MS;
+    Debug_Print("[OTA] Cooldown armed at OTA start\r\n");
+
     /* SSL context 1 — used by HTTP client (independent of context 0 = MQTT).
      * Re-applied here because AT+QIDEACT (from a previous reconnect) resets
      * QSSLCFG RAM settings.                                                 */
