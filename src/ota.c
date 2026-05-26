@@ -154,12 +154,15 @@ static void ota_error(const char *reason)
     snprintf(msg, sizeof(msg), "{\"ota_status\":\"error\",\"reason\":\"%s\"}", reason);
     ota_publish(msg);
 
-    ota_send("AT+QHTTPSTOP");
-    ota_enter(OTA_ST_ERROR, 0);
-
     char dbg[64];
-    snprintf(dbg, sizeof(dbg), "[OTA] Error: %s\r\n", reason);
+    snprintf(dbg, sizeof(dbg), "[OTA] Error: %s — rebooting with sentinel\r\n", reason);
     Debug_Print(dbg);
+
+    /* Route through OTA_ST_REBOOT so ota_reboot_sentinel is always set.
+     * Without this, the watchdog fires without the sentinel, the device
+     * reboots with no OTA cooldown, and the retained MQTT URL triggers
+     * another OTA immediately — infinite loop. */
+    ota_enter(OTA_ST_REBOOT, 2000);
 }
 
 static void ota_delay_wdg(uint32_t ms)
