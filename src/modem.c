@@ -2152,10 +2152,15 @@ static void modem_ota_start(const char *url)
      * PUBLISHING or PUB_WAIT_OK (connection heartbeat queued immediately on
      * CONNECTED).  Wait 700 ms for the in-progress publish to complete, then
      * flush stale modem bytes before sending our own AT+QMTPUBEX.            */
-    if (mqtt_state == MQTT_STATE_CONNECTED  ||
-        mqtt_state == MQTT_STATE_PUBLISHING ||
-        mqtt_state == MQTT_STATE_PUB_WAIT_OK) {
-        HAL_Delay(700);                        /* let previous publish finish */
+    if (mqtt_state == MQTT_STATE_CONNECTED   ||
+        mqtt_state == MQTT_STATE_PUBLISHING  ||
+        mqtt_state == MQTT_STATE_PUB_WAIT_OK ||
+        mqtt_state == MQTT_STATE_SUBSCRIBING) {
+        /* Retained OTA URL often arrives while AT+QMTSUB is still in progress
+         * (broker delivers retained messages during subscription processing).
+         * Wait 1500 ms: enough for subscribe to complete + any in-flight
+         * heartbeat publish to finish before we send AT+QMTPUBEX.           */
+        HAL_Delay(1500);
         HAL_IWDG_Refresh(&hiwdg);
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
 
