@@ -834,7 +834,15 @@ void OTA_Process(void)
             ota_delay_wdg(3000);
             ota_send("AT+QIDEACT=1");
             ota_delay_wdg(5000);
-            ota_reboot_sentinel = OTA_REBOOT_SENTINEL;  /* mark intentional OTA reboot */
+            /* Reset the modem NOW while the MCU is still running to kick IWDG.
+             * Modem_Init previously ran CFUN=1,1 after MCU reset but RDY often
+             * timed out (>30 s after a big HTTPS download), leaving the modem
+             * in a half-reset state that prevented MQTT from reconnecting.
+             * Doing CFUN here: MCU keeps feeding IWDG for the full 35 s, modem
+             * completes cleanly, then MCU resets into a fresh modem.          */
+            ota_send("AT+CFUN=1,1");
+            ota_delay_wdg(35000);   /* 35 s: modem fully resets + APP RDY     */
+            ota_reboot_sentinel = OTA_REBOOT_SENTINEL;
             NVIC_SystemReset();
         }
         break;

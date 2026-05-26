@@ -2504,30 +2504,16 @@ void Modem_Init(UART_HandleTypeDef *huart)
             ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
             Debug_Print("[OTA] Post-OTA: bootloader CRC fail — old firmware kept\r\n");
         }
-        /* AT+QHTTPSTOP does NOT fully free the TLS context-1 heap on the
-         * EC200U after an HTTPS OTA download.  Without clearing it,
-         * AT+QMTOPEN cannot allocate SSL buffers for MQTT context 0 and
-         * MQTT never reconnects after OTA (confirmed: QMTOPEN? returns
-         * just "OK" — no active session).  AT+CFUN=1,1 performs a full
-         * modem software reset which clears all TLS heap.
-         * OTA_IsActive() returns true during OTA_ST_REBOOT so the
-         * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
-        Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
-        modem_cmd("AT+CFUN=1,1");
-        /* Wait up to 30 s for the "RDY" URC signalling modem restart done.
-         * modem_sync_expect() pets IWDG every 1 ms — watchdog safe.       */
-        bool rdy_seen = modem_sync_expect("RDY", 30000);
-        (void)rdy_seen;
-        /* 10 s additional settle: SIM CPIN, partial network registration   */
-        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        /* OTA_ST_REBOOT already ran AT+CFUN=1,1 and waited 35 s for the
+         * modem to fully reset before NVIC_SystemReset().  The modem is
+         * already in a clean state — no second CFUN needed here.
+         * Just drain any residual boot URCs (APP RDY etc.) and proceed. */
+        Debug_Print("[MODEM] OTA reboot — modem pre-reset in OTA_ST_REBOOT, draining URCs\r\n");
+        for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
         IWDG->KR = 0xAAAAU;
-        Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
     } else {
-        /* Cold boot OR non-OTA soft reset (MQTT watchdog, etc.) — just wait
-         * for the modem to settle.  CFUN=1,1 is only needed after a true OTA
-         * download (TLS heap stuck); applying it on every watchdog reset
-         * destabilises the modem and creates an infinite CFUN loop. */
+        /* Cold boot OR non-OTA soft reset — just wait for modem to settle. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
     }
     if (!modem_sync_cmd_ok("AT", 2000, 15))
