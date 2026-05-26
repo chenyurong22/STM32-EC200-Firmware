@@ -195,6 +195,7 @@ static bool pub_status2_needed = false;
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
 static uint32_t lora_log_last_ms   = 0;
+static uint32_t mqtt_connected_last_ms = 0; /* HAL_GetTick() of last MQTT_STATE_CONNECTED tick */
 static bool     prev_relay1        = false;
 static bool     prev_relay2        = false;
 static bool     prev_dry_run_trip  = false;
@@ -2783,6 +2784,18 @@ void Modem_Process(void)
         mqtt_state = MQTT_STATE_CONNECTED;
     }
 
+    /* ── MQTT connectivity watchdog — reset if disconnected > 5 min ── */
+    if (mqtt_state == MQTT_STATE_CONNECTED)
+        mqtt_connected_last_ms = HAL_GetTick();
+    else if (mqtt_connected_last_ms &&
+             HAL_GetTick() - mqtt_connected_last_ms > 300000UL &&
+             !OTA_IsActive() && !LoRaOta_IsActive())
+    {
+        Debug_Print("[MQTT] Disconnected > 5 min — auto reset\r\n");
+        HAL_Delay(200);
+        NVIC_SystemReset();
+    }
+
     /* ── periodic tasks (only when fully connected) ── */
     if (mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive() && !LoRaOta_IsActive())
     {
@@ -2825,31 +2838,33 @@ void Modem_Process(void)
             pub_status2_needed = true; /* deferred — queue busy after publish_status() */
         }
 
-        /* LoRa heartbeat log every 60 s */
+        /* LoRa heartbeat log every 60 s — skip if Blue Pill never contacted */
         if (HAL_GetTick() - lora_log_last_ms >= LORA_LOG_INTERVAL_MS)
         {
             lora_log_last_ms = HAL_GetTick();
-            uint64_t ts = Modem_GetUnixMs();
-            uint32_t age_s = LoRa_GetLastRcvAge();
-            if (age_s == 0xFFFFFFFFUL) age_s = 0;
-            else                        age_s /= 1000;
-            char lora_log[128];
-            if (ts)
-                snprintf(lora_log, sizeof(lora_log),
-                         "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
-                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,\"ts\":%llu}",
-                         LoRa_GetRelay3State(), LoRa_GetRelay4State(),
-                         LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
-                         (unsigned long)age_s,
-                         (unsigned long long)ts);
-            else
-                snprintf(lora_log, sizeof(lora_log),
-                         "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
-                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu}",
-                         LoRa_GetRelay3State(), LoRa_GetRelay4State(),
-                         LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
-                         (unsigned long)age_s);
-            queue_publish(TOPIC_SLAVE_LOG, lora_log);
+            uint32_t age_raw = LoRa_GetLastRcvAge();
+            if (age_raw != 0xFFFFFFFFUL && age_raw < 90000UL) /* only log if recently heard */
+            {
+                uint64_t ts    = Modem_GetUnixMs();
+                uint32_t age_s = age_raw / 1000U;
+                char lora_log[128];
+                if (ts)
+                    snprintf(lora_log, sizeof(lora_log),
+                             "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
+                             "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,\"ts\":%llu}",
+                             LoRa_GetRelay3State(), LoRa_GetRelay4State(),
+                             LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
+                             (unsigned long)age_s,
+                             (unsigned long long)ts);
+                else
+                    snprintf(lora_log, sizeof(lora_log),
+                             "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
+                             "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu}",
+                             LoRa_GetRelay3State(), LoRa_GetRelay4State(),
+                             LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
+                             (unsigned long)age_s);
+                queue_publish(TOPIC_SLAVE_LOG, lora_log);
+            }
         }
 
         /* run protection every 1 s */
