@@ -2510,6 +2510,21 @@ void Modem_Init(UART_HandleTypeDef *huart)
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
         IWDG->KR = 0xAAAAU;
         Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
+    } else if ((reset_csr & RCC_CSR_SFTRSTF) != 0) {
+        /* Software reset that is NOT an OTA reboot — e.g. MQTT watchdog,
+         * post-OTA-failure recovery, or any other NVIC_SystemReset() path.
+         * AT+QHTTPSTOP does NOT free the HTTP/TLS heap on EC200U; only
+         * CFUN=1,1 fully clears it.  Without this, QMTOPEN fails silently
+         * after any previous HTTPS OTA attempt (successful or failed) and
+         * MQTT never reconnects.                                           */
+        Debug_Print("[MODEM] Soft reset — AT+CFUN=1,1 to clear TLS heap\r\n");
+        modem_cmd("AT+CFUN=1,1");
+        bool rdy_soft = modem_sync_expect("RDY", 30000);
+        (void)rdy_soft;
+        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
+        IWDG->KR = 0xAAAAU;
+        Debug_Print("[MODEM] Soft-reset CFUN + settle complete\r\n");
     } else {
         /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
