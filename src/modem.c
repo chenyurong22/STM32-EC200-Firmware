@@ -2056,6 +2056,13 @@ static bool modem_sync_expect(const char *expected, uint32_t timeout_ms)
             if (lpos > 0) {
                 strncpy(modem_last_resp, linebuf, sizeof(modem_last_resp) - 1);
                 modem_last_resp[sizeof(modem_last_resp) - 1] = '\0';
+                /* Side-channel: save +CMTI URC even during blocking waits.
+                 * Without this, a new SMS arriving during e.g. the 40s
+                 * QIDEACT wait is silently lost and sms_pending never set. */
+                if (strstr(linebuf, "+CMTI:")) {
+                    const char *p = strrchr(linebuf, ',');
+                    if (p) { sms_index = atoi(p + 1); sms_pending = true; }
+                }
                 if (strstr(linebuf, expected)) return true;
                 if (strstr(linebuf, "ERROR"))  return false;
             }
@@ -2066,6 +2073,33 @@ static bool modem_sync_expect(const char *expected, uint32_t timeout_ms)
     }
     strncpy(modem_last_resp, "timeout", sizeof(modem_last_resp) - 1);
     return false; /* timeout */
+}
+
+/* Drain the UART RX buffer while detecting +CMTI URCs so SMS notifications
+ * received during blocking HAL_Delay / QMTCLOSE / QIDEACT windows are not
+ * silently lost.  Replaces raw { while (HAL_UART_Receive...) {} } flush loops
+ * in Modem_Init and the DISCONNECTED reconnect sequence.
+ * byte_timeout_ms: per-byte HAL_UART_Receive timeout (1 ms = fast drain).   */
+static void modem_flush_detect_cmti(uint32_t byte_timeout_ms)
+{
+    char lb[32]; int lp = 0;
+    for (;;) {
+        IWDG->KR = 0xAAAAU;
+        uint8_t c;
+        if (HAL_UART_Receive(modem_uart, &c, 1, byte_timeout_ms) != HAL_OK) break;
+        if (c == '\r') continue;
+        if (c == '\n') {
+            lb[lp] = '\0';
+            if (lp > 0 && strstr(lb, "+CMTI:")) {
+                const char *p = strrchr(lb, ',');
+                if (p) { sms_index = atoi(p + 1); sms_pending = true; }
+            }
+            lp = 0;
+        } else if (lp < (int)sizeof(lb) - 1) {
+            lb[lp++] = (char)c;
+        }
+    }
+    rxpos = 0; /* discard any partial line in the main line buffer */
 }
 
 /* Send an AT command and wait for an OK response.
@@ -2484,7 +2518,7 @@ void Modem_Init(UART_HandleTypeDef *huart)
         }
         /* 10 s settle after APP RDY: SIM CPIN + partial LTE registration   */
         for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
-        { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
+        modem_flush_detect_cmti(100); /* drain settle URCs; save +CMTI if any */
         IWDG->KR = 0xAAAAU;
         Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
     } else {
@@ -2540,16 +2574,17 @@ void Modem_Init(UART_HandleTypeDef *huart)
      * come AFTER this to avoid being overwritten by the NVM reload.          */
     modem_cmd("AT+QMTCLOSE=0");
     HAL_Delay(1500);
-    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+    modem_flush_detect_cmti(1);  /* drain QMTCLOSE URCs; detect +CMTI */
     IWDG->KR = 0xAAAAU;   /* pet after QMTCLOSE — 2 s since last pet */
     modem_cmd("AT+QIDEACT=1");
     /* Wait up to 40 s for the PDP context to fully deactivate (Quectel max spec).
      * modem_sync_expect pets IWDG every 1 ms so the watchdog cannot fire.
      * After OTA the modem may take several seconds to tear down the HTTP/TLS
      * session before it can release the PDP bearer — a fixed 2 s delay was not
-     * enough, leaving the context ACTIVE and causing QIACT=1 to return ERROR. */
+     * enough, leaving the context ACTIVE and causing QIACT=1 to return ERROR.
+     * modem_sync_expect now also detects +CMTI URCs arriving during the wait. */
     modem_sync_expect("OK", 40000);
-    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+    modem_flush_detect_cmti(1);  /* drain any late QIDEACT URCs; detect +CMTI */
     IWDG->KR = 0xAAAAU;
 
     /* Re-apply SSL context 0 AFTER QMTCLOSE+QIDEACT.
@@ -2931,15 +2966,8 @@ void Modem_Process(void)
             modem_cmd("AT+QMTCLOSE=0");
             HAL_Delay(1500);
             HAL_IWDG_Refresh(&hiwdg);
-            /* Flush URCs from QMTCLOSE (TCP teardown can take several seconds).
-             * Refresh IWDG every 500 ms so a chatty modem can't trigger a reset. */
-            {
-                uint8_t _c; uint32_t _t = HAL_GetTick();
-                while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {
-                    if (HAL_GetTick() - _t >= 500) { HAL_IWDG_Refresh(&hiwdg); _t = HAL_GetTick(); }
-                }
-                rxpos = 0;
-            }
+            /* Flush URCs from QMTCLOSE; detect +CMTI so SMS is not lost. */
+            modem_flush_detect_cmti(1);
             /* Re-apply after QMTCLOSE — QMTCLOSE reloads NVM which resets version
              * to default=3 (MQTT 3.1) which strips credentials from CONNECT.  */
             modem_cmd("AT+QMTCFG=\"version\",0,4");  /* keep MQTT 3.1.1        */
@@ -2956,14 +2984,8 @@ void Modem_Process(void)
             modem_cmd("AT+QIDEACT=1");
             HAL_Delay(1500);
             HAL_IWDG_Refresh(&hiwdg);
-            /* Flush URCs from QIDEACT (PDP deactivation URCs may arrive late). */
-            {
-                uint8_t _c; uint32_t _t = HAL_GetTick();
-                while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {
-                    if (HAL_GetTick() - _t >= 500) { HAL_IWDG_Refresh(&hiwdg); _t = HAL_GetTick(); }
-                }
-                rxpos = 0;
-            }
+            /* Flush URCs from QIDEACT; detect +CMTI so SMS is not lost. */
+            modem_flush_detect_cmti(1);
             recv_payload_pending = false; /* clear stale recv state           */
             pub_pending          = false; /* drop unsent publish              */
             /* Re-apply SSL context 0 after QMTCLOSE — NVM reload may have
