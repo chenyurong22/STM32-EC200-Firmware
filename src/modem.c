@@ -2465,14 +2465,25 @@ void Modem_Init(UART_HandleTypeDef *huart)
          * modem software reset which clears all TLS heap.
          * OTA_IsActive() returns true during OTA_ST_REBOOT so the
          * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
-        Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
-        modem_cmd("AT+CFUN=1,1");
-        /* Unconditional 45 s wait — do NOT depend on RDY arriving within a
-         * fixed window.  After a full HTTPS OTA download the EC200U can take
-         * >30 s to send RDY.  The old modem_sync_expect(30s) timed out before
-         * RDY arrived, leaving the modem mid-reset when AT commands were sent.
-         * 45 s guarantees RDY + SIM CPIN + partial LTE registration done.   */
-        for (int i = 0; i < 90; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        /* Retry CFUN up to 2 times, waiting for "APP RDY" (the final EC200U
+         * boot URC) up to 60 s each attempt.  APP RDY confirms the modem's
+         * application layer is fully up and TLS heap is cleared.
+         * The old 30s RDY wait timed out when the modem took >30s to reset
+         * after a big HTTPS download.  APP RDY always comes AFTER RDY and
+         * CPIN — it is the definitive "modem ready" signal.                */
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (attempt > 0)
+                Debug_Print("[MODEM] CFUN: APP RDY not seen — retrying CFUN\r\n");
+            Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
+            modem_cmd("AT+CFUN=1,1");
+            if (modem_sync_expect("APP RDY", 60000)) {
+                Debug_Print("[MODEM] CFUN: APP RDY received — modem ready\r\n");
+                break;
+            }
+            Debug_Print("[MODEM] CFUN: APP RDY timeout\r\n");
+        }
+        /* 10 s settle after APP RDY: SIM CPIN + partial LTE registration   */
+        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
         IWDG->KR = 0xAAAAU;
         Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
