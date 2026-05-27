@@ -154,15 +154,12 @@ static void ota_error(const char *reason)
     snprintf(msg, sizeof(msg), "{\"ota_status\":\"error\",\"reason\":\"%s\"}", reason);
     ota_publish(msg);
 
-    char dbg[64];
-    snprintf(dbg, sizeof(dbg), "[OTA] Error: %s — rebooting with sentinel\r\n", reason);
-    Debug_Print(dbg);
+    ota_send("AT+QHTTPSTOP");
+    ota_enter(OTA_ST_ERROR, 0);
 
-    /* Route through OTA_ST_REBOOT so ota_reboot_sentinel is always set.
-     * Without this, the watchdog fires without the sentinel, the device
-     * reboots with no OTA cooldown, and the retained MQTT URL triggers
-     * another OTA immediately — infinite loop. */
-    ota_enter(OTA_ST_REBOOT, 2000);
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "[OTA] Error: %s\r\n", reason);
+    Debug_Print(dbg);
 }
 
 static void ota_delay_wdg(uint32_t ms)
@@ -834,15 +831,7 @@ void OTA_Process(void)
             ota_delay_wdg(3000);
             ota_send("AT+QIDEACT=1");
             ota_delay_wdg(5000);
-            /* Reset the modem NOW while the MCU is still running to kick IWDG.
-             * Modem_Init previously ran CFUN=1,1 after MCU reset but RDY often
-             * timed out (>30 s after a big HTTPS download), leaving the modem
-             * in a half-reset state that prevented MQTT from reconnecting.
-             * Doing CFUN here: MCU keeps feeding IWDG for the full 35 s, modem
-             * completes cleanly, then MCU resets into a fresh modem.          */
-            ota_send("AT+CFUN=1,1");
-            ota_delay_wdg(35000);   /* 35 s: modem fully resets + APP RDY     */
-            ota_reboot_sentinel = OTA_REBOOT_SENTINEL;
+            ota_reboot_sentinel = OTA_REBOOT_SENTINEL;  /* mark intentional OTA reboot */
             NVIC_SystemReset();
         }
         break;

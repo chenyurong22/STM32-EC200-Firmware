@@ -195,8 +195,6 @@ static bool pub_status2_needed = false;
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
 static uint32_t lora_log_last_ms   = 0;
-static uint32_t mqtt_connected_last_ms = 0; /* HAL_GetTick() of last MQTT_STATE_CONNECTED tick */
-static uint32_t modem_boot_ms         = 0; /* HAL_GetTick() when Modem_Init() finished        */
 static bool     prev_relay1        = false;
 static bool     prev_relay2        = false;
 static bool     prev_dry_run_trip  = false;
@@ -2152,15 +2150,10 @@ static void modem_ota_start(const char *url)
      * PUBLISHING or PUB_WAIT_OK (connection heartbeat queued immediately on
      * CONNECTED).  Wait 700 ms for the in-progress publish to complete, then
      * flush stale modem bytes before sending our own AT+QMTPUBEX.            */
-    if (mqtt_state == MQTT_STATE_CONNECTED   ||
-        mqtt_state == MQTT_STATE_PUBLISHING  ||
-        mqtt_state == MQTT_STATE_PUB_WAIT_OK ||
-        mqtt_state == MQTT_STATE_SUBSCRIBING) {
-        /* Retained OTA URL often arrives while AT+QMTSUB is still in progress
-         * (broker delivers retained messages during subscription processing).
-         * Wait 1500 ms: enough for subscribe to complete + any in-flight
-         * heartbeat publish to finish before we send AT+QMTPUBEX.           */
-        HAL_Delay(1500);
+    if (mqtt_state == MQTT_STATE_CONNECTED  ||
+        mqtt_state == MQTT_STATE_PUBLISHING ||
+        mqtt_state == MQTT_STATE_PUB_WAIT_OK) {
+        HAL_Delay(700);                        /* let previous publish finish */
         HAL_IWDG_Refresh(&hiwdg);
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
 
@@ -2186,41 +2179,9 @@ static void modem_ota_start(const char *url)
             HAL_Delay(500);        /* wait for modem to process publish */
             /* Flush +QMTPUBEX response so it doesn't interfere with SSL cmds */
             { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
-
-            /* Self-clear the retained OTA message on pump/XX/ota so the
-             * device does NOT re-trigger OTA on the next reconnect even if
-             * the bridge misses the "starting" status.
-             * Publish empty payload + retain=1 → broker deletes the retained.
-             * NOTE: msgid MUST be 0 when qos=0 (EC200U rejects qos=1,msgid=0
-             * with ERROR and never shows the > prompt — silent failure). */
-            char clr_cmd[80];
-            snprintf(clr_cmd, sizeof(clr_cmd),
-                     "AT+QMTPUBEX=0,0,0,1,\"%s\",0", TOPIC_OTA);
-            modem_cmd(clr_cmd);
-            bool clr_prompt = false;
-            t0 = HAL_GetTick();
-            while (HAL_GetTick() - t0 < 3000) {
-                if (HAL_UART_Receive(modem_uart, &c, 1, 5) == HAL_OK && c == '>') {
-                    clr_prompt = true; break;
-                }
-            }
-            if (clr_prompt) {
-                ctrlz = 0x1A;
-                HAL_UART_Transmit(modem_uart, &ctrlz, 1, 500); /* 0-byte payload */
-                HAL_Delay(300);
-                { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 50) == HAL_OK) {} }
-                Debug_Print("[OTA] Retained OTA topic self-cleared\r\n");
-            }
         }
         HAL_IWDG_Refresh(&hiwdg);
     }
-
-    /* Arm OTA cooldown NOW — before phase 2 CFUN — so that if phase 2 fails
-     * and MQTT reconnects, the retained URL cannot re-trigger OTA immediately.
-     * Without this, any early phase-2 failure caused an instant retry loop:
-     * MQTT reconnect → retained URL → modem_ota_start → CFUN → fail → repeat. */
-    ota_retry_block_until = HAL_GetTick() + OTA_RETRY_BLOCK_MS;
-    Debug_Print("[OTA] Cooldown armed at OTA start\r\n");
 
     /* SSL context 1 — used by HTTP client (independent of context 0 = MQTT).
      * Re-applied here because AT+QIDEACT (from a previous reconnect) resets
@@ -2478,14 +2439,6 @@ void Modem_Init(UART_HandleTypeDef *huart)
     RCC->CSR |= RCC_CSR_RMVF;   /* clear reset-cause flags for next check */
 
     if (ota_reboot) {
-        /* Block OTA retrigger for 5 minutes after an OTA reboot.
-         * After ota_reboot, CFUN=1,1 + settle + MQTT connect takes ~3 min.
-         * The previous 2-min cooldown expired BEFORE MQTT even connected,
-         * so the retained OTA URL triggered an instant re-OTA loop every time.
-         * 5 min guarantees the cooldown outlasts MQTT reconnection. */
-        ota_retry_block_until = HAL_GetTick() + 300000UL;
-        Debug_Print("[OTA] Cooldown armed (5 min) to prevent post-OTA loop\r\n");
-
         /* Check OTA flags to determine if the bootloader applied the update.
          * Bootloader erases the flags page (all bytes → 0xFF) after a
          * successful App B → App A copy.  If the flags magic is still
@@ -2504,16 +2457,27 @@ void Modem_Init(UART_HandleTypeDef *huart)
             ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
             Debug_Print("[OTA] Post-OTA: bootloader CRC fail — old firmware kept\r\n");
         }
-        /* OTA_ST_REBOOT already ran AT+CFUN=1,1 and waited 35 s for the
-         * modem to fully reset before NVIC_SystemReset().  The modem is
-         * already in a clean state — no second CFUN needed here.
-         * Just drain any residual boot URCs (APP RDY etc.) and proceed. */
-        Debug_Print("[MODEM] OTA reboot — modem pre-reset in OTA_ST_REBOOT, draining URCs\r\n");
-        for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        /* AT+QHTTPSTOP does NOT fully free the TLS context-1 heap on the
+         * EC200U after an HTTPS OTA download.  Without clearing it,
+         * AT+QMTOPEN cannot allocate SSL buffers for MQTT context 0 and
+         * MQTT never reconnects after OTA (confirmed: QMTOPEN? returns
+         * just "OK" — no active session).  AT+CFUN=1,1 performs a full
+         * modem software reset which clears all TLS heap.
+         * OTA_IsActive() returns true during OTA_ST_REBOOT so the
+         * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
+        Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
+        modem_cmd("AT+CFUN=1,1");
+        /* Wait up to 30 s for the "RDY" URC signalling modem restart done.
+         * modem_sync_expect() pets IWDG every 1 ms — watchdog safe.       */
+        bool rdy_seen = modem_sync_expect("RDY", 30000);
+        (void)rdy_seen;
+        /* 10 s additional settle: SIM CPIN, partial network registration   */
+        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
         IWDG->KR = 0xAAAAU;
+        Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
     } else {
-        /* Cold boot OR non-OTA soft reset — just wait for modem to settle. */
+        /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
     }
     if (!modem_sync_cmd_ok("AT", 2000, 15))
@@ -2636,7 +2600,6 @@ void Modem_Init(UART_HandleTypeDef *huart)
      * (APP RDY, +CFUN: 1) that arrive during the config phase must not
      * re-trigger a full Modem_Init unnecessarily.                       */
     modem_init_grace_until = HAL_GetTick() + 20000UL;
-    modem_boot_ms = HAL_GetTick();   /* start the never-connected watchdog clock */
     modem_cmd("AT+CEREG?");
 }
 
@@ -2820,27 +2783,6 @@ void Modem_Process(void)
         mqtt_state = MQTT_STATE_CONNECTED;
     }
 
-    /* ── MQTT connectivity watchdog ─────────────────────────────────────
-     * Fires if MQTT has not been connected for > 5 min, measured from
-     * whichever is later: last successful connect OR boot completion.
-     * Covers two cases:
-     *   1. Was connected, then dropped (mqtt_connected_last_ms set).
-     *   2. Never connected at all this boot (e.g. TLS heap stuck after
-     *      OTA failure) — use modem_boot_ms as fallback reference so the
-     *      watchdog still fires and CFUN=1,1 clears the stale TLS state. */
-    if (mqtt_state == MQTT_STATE_CONNECTED)
-        mqtt_connected_last_ms = HAL_GetTick();
-    else if (!OTA_IsActive() && !LoRaOta_IsActive())
-    {
-        uint32_t ref = mqtt_connected_last_ms ? mqtt_connected_last_ms : modem_boot_ms;
-        if (ref && (HAL_GetTick() - ref) > 300000UL)
-        {
-            Debug_Print("[MQTT] No connection for 5 min — auto reset\r\n");
-            HAL_Delay(200);
-            NVIC_SystemReset();
-        }
-    }
-
     /* ── periodic tasks (only when fully connected) ── */
     if (mqtt_state == MQTT_STATE_CONNECTED && !OTA_IsActive() && !LoRaOta_IsActive())
     {
@@ -2883,33 +2825,31 @@ void Modem_Process(void)
             pub_status2_needed = true; /* deferred — queue busy after publish_status() */
         }
 
-        /* LoRa heartbeat log every 60 s — skip if Blue Pill never contacted */
+        /* LoRa heartbeat log every 60 s */
         if (HAL_GetTick() - lora_log_last_ms >= LORA_LOG_INTERVAL_MS)
         {
             lora_log_last_ms = HAL_GetTick();
-            uint32_t age_raw = LoRa_GetLastRcvAge();
-            if (age_raw != 0xFFFFFFFFUL && age_raw < 90000UL) /* only log if recently heard */
-            {
-                uint64_t ts    = Modem_GetUnixMs();
-                uint32_t age_s = age_raw / 1000U;
-                char lora_log[128];
-                if (ts)
-                    snprintf(lora_log, sizeof(lora_log),
-                             "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
-                             "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,\"ts\":%llu}",
-                             LoRa_GetRelay3State(), LoRa_GetRelay4State(),
-                             LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
-                             (unsigned long)age_s,
-                             (unsigned long long)ts);
-                else
-                    snprintf(lora_log, sizeof(lora_log),
-                             "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
-                             "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu}",
-                             LoRa_GetRelay3State(), LoRa_GetRelay4State(),
-                             LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
-                             (unsigned long)age_s);
-                queue_publish(TOPIC_SLAVE_LOG, lora_log);
-            }
+            uint64_t ts = Modem_GetUnixMs();
+            uint32_t age_s = LoRa_GetLastRcvAge();
+            if (age_s == 0xFFFFFFFFUL) age_s = 0;
+            else                        age_s /= 1000;
+            char lora_log[128];
+            if (ts)
+                snprintf(lora_log, sizeof(lora_log),
+                         "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
+                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,\"ts\":%llu}",
+                         LoRa_GetRelay3State(), LoRa_GetRelay4State(),
+                         LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
+                         (unsigned long)age_s,
+                         (unsigned long long)ts);
+            else
+                snprintf(lora_log, sizeof(lora_log),
+                         "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
+                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu}",
+                         LoRa_GetRelay3State(), LoRa_GetRelay4State(),
+                         LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
+                         (unsigned long)age_s);
+            queue_publish(TOPIC_SLAVE_LOG, lora_log);
         }
 
         /* run protection every 1 s */
