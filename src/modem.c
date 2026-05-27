@@ -2467,12 +2467,12 @@ void Modem_Init(UART_HandleTypeDef *huart)
          * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
         Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
         modem_cmd("AT+CFUN=1,1");
-        /* Wait up to 30 s for the "RDY" URC signalling modem restart done.
-         * modem_sync_expect() pets IWDG every 1 ms — watchdog safe.       */
-        bool rdy_seen = modem_sync_expect("RDY", 30000);
-        (void)rdy_seen;
-        /* 10 s additional settle: SIM CPIN, partial network registration   */
-        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        /* Unconditional 45 s wait — do NOT depend on RDY arriving within a
+         * fixed window.  After a full HTTPS OTA download the EC200U can take
+         * >30 s to send RDY.  The old modem_sync_expect(30s) timed out before
+         * RDY arrived, leaving the modem mid-reset when AT commands were sent.
+         * 45 s guarantees RDY + SIM CPIN + partial LTE registration done.   */
+        for (int i = 0; i < 90; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
         { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 100) == HAL_OK) {} }
         IWDG->KR = 0xAAAAU;
         Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
