@@ -236,6 +236,10 @@ static bool qmtopen_tls_seen = false;
 /* Set when unsolicited modem reboot URCs are seen (RDY/+CFUN: 1) so
  * Modem_Process can run a full Modem_Init() re-initialization. */
 static bool modem_reinit_pending = false;
+/* Set in Modem_Init when this boot was an OTA reboot.  Causes the nuclear
+ * CFUN option to fire after just ONE DISCONNECTED failure instead of five,
+ * so MQTT reconnects in ~2-4 min rather than ~8-12 min post-OTA.           */
+static bool ota_first_reconnect = false;
 
 static bool ota_retry_blocked(void)
 {
@@ -1994,7 +1998,8 @@ static void process_line(const char *line)
         {
             /* lora_ota topic subscribed — fully connected now */
             Debug_Print("[MQTT] Subscribed to " TOPIC_LORA_OTA "\r\n");
-            disconnected_count = 0; /* clear failure counter on successful connect */
+            disconnected_count  = 0;       /* clear failure counter on successful connect */
+            ota_first_reconnect = false;   /* no longer in post-OTA reconnect window      */
             blink_n(3); /* 3 blinks = MQTT fully connected! */
             HAL_IWDG_Refresh(&hiwdg);
 
@@ -2518,6 +2523,10 @@ void Modem_Init(UART_HandleTypeDef *huart)
     RCC->CSR |= RCC_CSR_RMVF;   /* clear reset-cause flags for next check */
 
     if (ota_reboot) {
+        /* Signal DISCONNECTED reconnect to fire nuclear CFUN after 1 failure
+         * instead of 5 — makes MQTT reconnect in ~2-4 min rather than ~10. */
+        ota_first_reconnect = true;
+        disconnected_count  = 0;
         /* Check OTA flags to determine if the bootloader applied the update.
          * Bootloader erases the flags page (all bytes → 0xFF) after a
          * successful App B → App A copy.  If the flags magic is still
@@ -3008,14 +3017,17 @@ void Modem_Process(void)
             qmtopen_tls_seen = false;
             disconnected_count++;
 
-            /* ── Nuclear option: 5+ consecutive failures → CFUN hard reset ── *
-             * After ~4 min stuck in DISCONNECTED the most likely cause is a     *
-             * residual TLS heap or SSL context issue that survive normal         *
-             * QMTCLOSE/QIDEACT cleanup.  AT+CFUN=1,1 is the only reliable fix. */
-            if (disconnected_count > 5)
+            /* ── Nuclear option: CFUN hard reset on persistent failure ── *
+             * After an OTA reboot: fire after 1 failure (TLS heap may still    *
+             * be dirty from HTTPS download; CFUN is the only reliable fix).    *
+             * Normal operation: fire after 5 failures (~4 min of retries).     *
+             * AT+CFUN=1,1 is the only way to fully clear EC200U TLS heap.      */
+            int nuclear_threshold = ota_first_reconnect ? 1 : 5;
+            if (disconnected_count > nuclear_threshold)
             {
-                disconnected_count = 0;
-                Debug_Print("[MQTT] DISCONNECTED x5 — CFUN hard reset\r\n");
+                disconnected_count  = 0;
+                ota_first_reconnect = false; /* reset post-OTA flag */
+                Debug_Print("[MQTT] DISCONNECTED nuclear — CFUN hard reset\r\n");
                 modem_cmd("AT+CFUN=1,1");
                 if (!modem_sync_expect("APP RDY", 60000))
                     Debug_Print("[MQTT] CFUN APP RDY timeout\r\n");
