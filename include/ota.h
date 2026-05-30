@@ -67,7 +67,6 @@ bool OTA_ShouldYieldRx(void);
  *   - Forward all AT lines to OTA_HandleLine()                              */
 bool OTA_IsActive(void);
 bool OTA_WasRebootPending(void);  /* true only after intentional OTA_ST_REBOOT reset */
-bool OTA_WasCFUNPreDone(void);   /* true only if CFUN was pre-done in OTA_ST_REBOOT  */
 
 /* Binary passthrough for AT+QFREAD raw data.
  * After modem.c sees "CONNECT N\n", it calls OTA_SetBinaryExpect(N), then
@@ -87,8 +86,3 @@ void OTA_SetSendFn(OTA_SendFn fn);
 typedef void (*OTA_PublishFn)(const char *topic, const char *payload);
 void OTA_SetPublishFn(OTA_PublishFn fn);
 
-/* Receive function pointer — set by modem.c so OTA can poll UART during
- * blocking waits (e.g. detecting "APP RDY" after AT+CFUN=1,1).
- * Returns 0 on success (one byte stored in *c), -1 on timeout / error.  */
-typedef int (*OTA_RecvFn)(uint8_t *c, uint32_t timeout_ms);
-void OTA_SetRecvFn(OTA_RecvFn fn);

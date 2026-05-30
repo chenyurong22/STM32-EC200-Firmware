@@ -84,7 +84,6 @@ static uint32_t ota_stream_buf_count = 0;
 /* Callbacks */
 static OTA_SendFn    ota_send_fn    = NULL;
 static OTA_PublishFn ota_publish_fn = NULL;
-static OTA_RecvFn    ota_recv_fn    = NULL;
 
 /* Sentinel in .noinit RAM: survives NVIC_SystemReset but not POR.
  * Written just before the intentional OTA reboot so modem.c can
@@ -92,20 +91,12 @@ static OTA_RecvFn    ota_recv_fn    = NULL;
 #define OTA_REBOOT_SENTINEL 0xDEADBEEFUL
 static volatile uint32_t ota_reboot_sentinel __attribute__((section(".noinit")));
 
-/* Second sentinel: set AFTER AT+CFUN=1,1 completes in OTA_ST_REBOOT,
- * meaning the modem has already been reset and LTE re-registration has
- * been running for ~75 s before the STM32 reboots.  Modem_Init checks
- * this to skip its own CFUN step and just settle briefly instead.      */
-#define OTA_CFUN_DONE_SENTINEL 0xCAFEBABEUL
-static volatile uint32_t ota_cfun_done_sentinel __attribute__((section(".noinit")));
-
 /* Prototypes */
 static void ota_stream_buf_reset(void);
 static bool ota_stream_buf_push(uint8_t b);
 static uint32_t ota_stream_buf_pop_chunk(uint8_t *dst, uint32_t max_len);
 static void ota_recover_http_bearer(void);
 static void ota_delay_wdg(uint32_t ms);
-static bool ota_wait_app_rdy(uint32_t timeout_ms);
 static void ota_send_qhttpget(void);
 static void ota_delete_stale_file(void);
 static bool ota_retry_qhttpget(const char *reason);
@@ -179,36 +170,6 @@ static void ota_delay_wdg(uint32_t ms)
         HAL_Delay(50);
     }
     HAL_IWDG_Refresh(&hiwdg);
-}
-
-/* Poll UART for the "APP RDY" line from EC200U after AT+CFUN=1,1.
- * Returns true if "APP RDY" is seen within timeout_ms; false on timeout.
- * Refreshes IWDG on every byte poll iteration (~1 ms each).
- * Falls back to a timed wait (returns false) if ota_recv_fn is NULL.   */
-static bool ota_wait_app_rdy(uint32_t timeout_ms)
-{
-    if (!ota_recv_fn) {
-        /* No receive callback — just wait the full time; caller decides
-         * whether to set cfun_done sentinel based on the return value.  */
-        ota_delay_wdg(timeout_ms);
-        return false;
-    }
-    char line[32]; int lpos = 0;
-    uint32_t t0 = HAL_GetTick();
-    while (HAL_GetTick() - t0 < timeout_ms) {
-        HAL_IWDG_Refresh(&hiwdg);
-        uint8_t c;
-        if (ota_recv_fn(&c, 1) != 0) continue; /* 1 ms byte timeout */
-        if (c == '\r') continue;
-        if (c == '\n') {
-            line[lpos] = '\0';
-            if (lpos > 0 && strcmp(line, "APP RDY") == 0) return true;
-            lpos = 0;
-        } else if (lpos < (int)sizeof(line) - 1) {
-            line[lpos++] = (char)c;
-        }
-    }
-    return false; /* timeout */
 }
 
 static void ota_recover_http_bearer(void)
@@ -441,16 +402,6 @@ bool OTA_WasRebootPending(void)
     }
     return false;
 }
-/* Returns true (and clears sentinel) iff CFUN was pre-done in OTA_ST_REBOOT.
- * Modem_Init uses this to skip its own CFUN reset after an OTA reboot.    */
-bool OTA_WasCFUNPreDone(void)
-{
-    if (ota_cfun_done_sentinel == OTA_CFUN_DONE_SENTINEL) {
-        ota_cfun_done_sentinel = 0;
-        return true;
-    }
-    return false;
-}
 
 bool OTA_BinaryPending(void) { return ota_stream_active; }
 bool OTA_ShouldYieldRx(void) { return ota_stream_active && ota_stream_buf_count >= OTA_STREAM_YIELD_THRESHOLD; }
@@ -478,7 +429,6 @@ void OTA_ForceHttpReadStream(void)
 
 void OTA_SetSendFn(OTA_SendFn fn)    { ota_send_fn    = fn; }
 void OTA_SetPublishFn(OTA_PublishFn fn) { ota_publish_fn = fn; }
-void OTA_SetRecvFn(OTA_RecvFn fn)   { ota_recv_fn    = fn; }
 
 void OTA_FeedByte(uint8_t b)
 {
@@ -882,23 +832,12 @@ void OTA_Process(void)
             ota_delay_wdg(3000);
             ota_send("AT+QIDEACT=1");
             ota_delay_wdg(5000);
-            /* Reset modem so TLS heap clears and LTE re-registration
-             * starts before STM32 reboots.  Wait for "APP RDY" URC to
-             * confirm the modem actually processed AT+CFUN=1,1.
-             * Only set cfun_done sentinel if APP RDY is confirmed —
-             * if CFUN failed silently the sentinel stays clear and
-             * Modem_Init's fallback path does CFUN itself.             */
-            Debug_Print("[OTA] Pre-reset CFUN — waiting for APP RDY\r\n");
-            ota_send("AT+CFUN=1,1");
-            bool app_rdy = ota_wait_app_rdy(60000); /* up to 60 s */
-            if (app_rdy) {
-                Debug_Print("[OTA] APP RDY confirmed — settling 20s for LTE\r\n");
-                ota_delay_wdg(20000); /* let LTE registration start    */
-                ota_cfun_done_sentinel = OTA_CFUN_DONE_SENTINEL;
-            } else {
-                Debug_Print("[OTA] APP RDY timeout — Modem_Init will CFUN\r\n");
-                /* cfun_done NOT set; Modem_Init fallback does CFUN     */
-            }
+            /* Do NOT issue AT+CFUN=1,1 here.  Modem_Init in the new
+             * firmware issues a single AT+CFUN=1,1 after detecting the
+             * OTA sentinel — that is the proven-reliable place to clear
+             * the EC200U TLS heap (double-CFUN caused intermittent
+             * APP RDY miss and left the modem unconfigured).           */
+            Debug_Print("[OTA] QHTTPSTOP+QIDEACT done — resetting STM32\r\n");
             ota_reboot_sentinel = OTA_REBOOT_SENTINEL;
             NVIC_SystemReset();
         }

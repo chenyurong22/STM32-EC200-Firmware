@@ -303,8 +303,7 @@ void Modem_Send(const char *cmd)
 /* Read one byte from the modem UART with a per-byte timeout.
  * Uses direct register access (matches Modem_Process fast-path) so the
  * HAL lock is not involved and overrun errors are cleared on every call.
- * Returns 0 on success (*c filled), -1 on timeout or invalid args.
- * Used as the OTA_RecvFn callback for APP RDY detection in OTA_ST_REBOOT. */
+ * Returns 0 on success (*c filled), -1 on timeout or invalid args. */
 int Modem_Receive(uint8_t *c, uint32_t timeout_ms)
 {
     if (!modem_uart || !c) return -1;
@@ -2583,12 +2582,11 @@ void Modem_Init(UART_HandleTypeDef *huart)
          * modem software reset which clears all TLS heap.
          * OTA_IsActive() returns true during OTA_ST_REBOOT so the
          * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
-        /* Consume the cfun_predone sentinel (written by OTA_ST_REBOOT) but
-         * always issue CFUN in Modem_Init regardless.  The pre-reboot CFUN in
-         * OTA_ST_REBOOT helps LTE re-register during the bootloader copy, but
-         * a second CFUN here guarantees a completely clean TLS heap before
-         * AT+QMTOPEN is called — this is the only reliable post-OTA fix.    */
-        OTA_WasCFUNPreDone(); /* clear sentinel */
+        /* AT+CFUN=1,1 clears the EC200U TLS heap left over from the HTTPS
+         * OTA download.  Without this, AT+QMTOPEN silently fails because
+         * TLS context-1 heap is still allocated from the HTTPS session.
+         * This single CFUN in Modem_Init is the proven-reliable place —
+         * OTA_ST_REBOOT no longer issues CFUN (double-CFUN was fragile). */
         Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
         for (int attempt = 0; attempt < 2; attempt++) {
             if (attempt > 0)
@@ -2709,7 +2707,6 @@ void Modem_Init(UART_HandleTypeDef *huart)
      * and publish MQTT status without a circular header dependency.         */
     OTA_Init();
     OTA_SetSendFn(Modem_Send);
-    OTA_SetRecvFn(Modem_Receive);  /* for APP RDY detection in OTA_ST_REBOOT */
     OTA_SetPublishFn(modem_ota_publish);
 
     /* Wire up LoRa OTA callbacks (pump03 Blue Pill firmware update over LoRa) */
