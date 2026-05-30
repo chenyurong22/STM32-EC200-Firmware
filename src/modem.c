@@ -182,6 +182,10 @@ static uint32_t lockout_until2  = 0;
 static char pub_topic[48];
 static char pub_payload[512];
 static bool pub_pending = false;
+/* Exact byte count sent in the last AT+QMTPUBEX command.
+ * Used to escape data mode when +QMTSTAT: arrives before '>' is processed:
+ * sending these bytes + Ctrl-Z exits EC200U fixed-length data mode cleanly. */
+static size_t pub_len_in_flight = 0;
 
 /* OTA error saved here so it survives MQTT reconnect (heartbeat would overwrite pub_pending) */
 static char ota_error_msg[80];
@@ -240,6 +244,11 @@ static bool modem_reinit_pending = false;
  * CFUN option to fire after just ONE DISCONNECTED failure instead of five,
  * so MQTT reconnects in ~2-4 min rather than ~8-12 min post-OTA.           */
 static bool ota_first_reconnect = false;
+
+/* Counts how many 5-s NET_WAIT polling cycles have elapsed.
+ * After 36 cycles (3 min) with no LTE registration, force DISCONNECTED
+ * so the nuclear CFUN recovery path can fire.                             */
+static uint8_t net_wait_tries = 0;
 
 static bool ota_retry_blocked(void)
 {
@@ -1727,6 +1736,7 @@ static void process_line(const char *line)
     case MQTT_STATE_BOOT:
         if (strstr(line, "RDY") || strstr(line, "OK"))
         {
+            net_wait_tries   = 0;
             mqtt_state = MQTT_STATE_NET_WAIT;
             state_entered_ms = HAL_GetTick();
             modem_cmd("ATE0"); /* echo off                  */
@@ -1741,10 +1751,17 @@ static void process_line(const char *line)
 
     /* ── wait for network registration (GPRS or LTE) ─────────────────── */
     case MQTT_STATE_NET_WAIT:
+        /* Accept any CEREG/CGREG mode byte (0, 1, or 2) so the pattern still
+         * matches if AT+CEREG=0 failed and the modem returns mode=1 or 2.
+         * "+CEREG: 2,1" also matches "+CEREG: 2,1,..." (mode=2 with location). */
         if (strstr(line, "+CGREG: 0,1") || strstr(line, "+CGREG: 0,5") ||
-            strstr(line, "+CEREG: 0,1") || strstr(line, "+CEREG: 0,5"))
+            strstr(line, "+CGREG: 1,1") || strstr(line, "+CGREG: 1,5") ||
+            strstr(line, "+CEREG: 0,1") || strstr(line, "+CEREG: 0,5") ||
+            strstr(line, "+CEREG: 1,1") || strstr(line, "+CEREG: 1,5") ||
+            strstr(line, "+CEREG: 2,1") || strstr(line, "+CEREG: 2,5"))
         {
             Debug_Print("[NET] Registered\r\n");
+            net_wait_tries   = 0;
             mqtt_state = MQTT_STATE_PDP_OPEN;
             state_entered_ms = HAL_GetTick();
             qicsgp_sent      = false; /* Modem_Process sends QICSGP after buffer drains */
@@ -1753,11 +1770,21 @@ static void process_line(const char *line)
         /* retry registration every 5s */
         if (HAL_GetTick() - state_entered_ms > 5000)
         {
-            Debug_Print("[NET] Waiting for registration...\r\n");
             state_entered_ms = HAL_GetTick();
-            modem_cmd("AT+CGREG?");
-            HAL_Delay(80);
-            modem_cmd("AT+CEREG?");
+            net_wait_tries++;
+            /* After 3 min (36 x 5 s) with no registration, force DISCONNECTED.
+             * This lets the nuclear CFUN recovery path fire even if the modem
+             * is stuck in a state where CEREG never returns a registered stat. */
+            if (net_wait_tries > 36) {
+                net_wait_tries = 0;
+                Debug_Print("[NET] NET_WAIT timeout (3 min) — forcing reconnect\r\n");
+                mqtt_state = MQTT_STATE_DISCONNECTED;
+            } else {
+                Debug_Print("[NET] Waiting for registration...\r\n");
+                modem_cmd("AT+CGREG?");
+                HAL_Delay(80);
+                modem_cmd("AT+CEREG?");
+            }
         }
         break;
 
@@ -1773,6 +1800,7 @@ static void process_line(const char *line)
         if (strstr(line, "ERROR"))
         {
             Debug_Print("[NET] APN config error — retrying\r\n");
+            net_wait_tries   = 0;
             mqtt_state = MQTT_STATE_NET_WAIT;
             state_entered_ms = HAL_GetTick();
             qicsgp_sent = false;
@@ -1820,6 +1848,7 @@ static void process_line(const char *line)
                 /* Retry also failed — give up and restart from NET_WAIT */
                 qiact_retry_done = false;
                 Debug_Print("[NET] PDP activate failed (retry exhausted) — restarting\r\n");
+                net_wait_tries   = 0;
                 mqtt_state = MQTT_STATE_NET_WAIT;
                 state_entered_ms = HAL_GetTick();
             }
@@ -1828,6 +1857,7 @@ static void process_line(const char *line)
         if (HAL_GetTick() - state_entered_ms > 30000)
         {
             Debug_Print("[NET] PDP activate timeout — retrying\r\n");
+            net_wait_tries   = 0;
             mqtt_state = MQTT_STATE_NET_WAIT;
             state_entered_ms = HAL_GetTick();
         }
@@ -2553,35 +2583,28 @@ void Modem_Init(UART_HandleTypeDef *huart)
          * modem software reset which clears all TLS heap.
          * OTA_IsActive() returns true during OTA_ST_REBOOT so the
          * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
-        bool cfun_predone = OTA_WasCFUNPreDone();
-        if (cfun_predone) {
-            /* CFUN was already sent in OTA_ST_REBOOT ~75 s ago; the modem
-             * has been up and re-registering on LTE throughout bootloader +
-             * MCU init.  Just drain stray URCs and continue.               */
-            Debug_Print("[MODEM] OTA reboot — CFUN pre-done, modem up already\r\n");
-            for (int i = 0; i < 6; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; } /* 3 s */
-            modem_flush_detect_cmti(100);
-            IWDG->KR = 0xAAAAU;
-        } else {
-            /* Fallback: sentinel not found (first OTA with new firmware, or
-             * unexpected reset).  Do CFUN now to clear TLS heap.           */
-            for (int attempt = 0; attempt < 2; attempt++) {
-                if (attempt > 0)
-                    Debug_Print("[MODEM] CFUN: APP RDY not seen — retrying CFUN\r\n");
-                Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
-                modem_cmd("AT+CFUN=1,1");
-                if (modem_sync_expect("APP RDY", 60000)) {
-                    Debug_Print("[MODEM] CFUN: APP RDY received — modem ready\r\n");
-                    break;
-                }
-                Debug_Print("[MODEM] CFUN: APP RDY timeout\r\n");
+        /* Consume the cfun_predone sentinel (written by OTA_ST_REBOOT) but
+         * always issue CFUN in Modem_Init regardless.  The pre-reboot CFUN in
+         * OTA_ST_REBOOT helps LTE re-register during the bootloader copy, but
+         * a second CFUN here guarantees a completely clean TLS heap before
+         * AT+QMTOPEN is called — this is the only reliable post-OTA fix.    */
+        OTA_WasCFUNPreDone(); /* clear sentinel */
+        Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (attempt > 0)
+                Debug_Print("[MODEM] CFUN: APP RDY not seen — retrying CFUN\r\n");
+            modem_cmd("AT+CFUN=1,1");
+            if (modem_sync_expect("APP RDY", 60000)) {
+                Debug_Print("[MODEM] CFUN: APP RDY received — modem ready\r\n");
+                break;
             }
-            /* 10 s settle after APP RDY: SIM CPIN + partial LTE registration */
-            for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
-            modem_flush_detect_cmti(100); /* drain settle URCs; save +CMTI if any */
-            IWDG->KR = 0xAAAAU;
-            Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
+            Debug_Print("[MODEM] CFUN: APP RDY timeout\r\n");
         }
+        /* 10 s settle after APP RDY: SIM CPIN + partial LTE registration */
+        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+        modem_flush_detect_cmti(100); /* drain settle URCs; save +CMTI if any */
+        IWDG->KR = 0xAAAAU;
+        Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
     } else {
         /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
@@ -2702,6 +2725,7 @@ void Modem_Init(UART_HandleTypeDef *huart)
      * context configuration even after a previous QIDEACT.              */
     if (ota_reboot)
         Debug_Print("[MODEM] OTA reboot — PDP deactivated, going to NET_WAIT\r\n");
+    net_wait_tries   = 0;
     mqtt_state       = MQTT_STATE_NET_WAIT;
     state_entered_ms = HAL_GetTick();
     /* Suppress modem_reinit for 20 s after init — late EC200U boot URCs
@@ -2785,20 +2809,34 @@ void Modem_Process(void)
         if (c == '\r')
             continue;
 
-        /* '>' is the publish prompt — not followed by '\n', catch it here */
-                if (c == '>')
+        /* '>' is the publish prompt — not followed by '
+', catch it here */
+        if (c == '>')
         {
             if (mqtt_state == MQTT_STATE_PUBLISHING && pub_pending)
             {
-                /* Send payload immediately � any blocking delay here risks
-                 * the modem aborting the input window.                     */
+                /* Normal path: send payload + Ctrl-Z, await +QMTPUBEX URC. */
                 HAL_UART_Transmit(modem_uart,
                                   (uint8_t *)pub_payload, strlen(pub_payload), 3000);
-                /* Ctrl-Z commits the message */
                 uint8_t ctrlz = 0x1A;
                 HAL_UART_Transmit(modem_uart, &ctrlz, 1, 1000);
+                pub_len_in_flight = 0; /* payload delivered, no escape needed */
                 mqtt_state = MQTT_STATE_PUB_WAIT_OK;
                 state_entered_ms = HAL_GetTick();
+            }
+            else if (mqtt_state == MQTT_STATE_DISCONNECTED && pub_len_in_flight > 0)
+            {
+                /* Race: +QMTSTAT: arrived before '>' was processed.
+                 * EC200U is in fixed-length data mode waiting for exactly
+                 * pub_len_in_flight bytes.  Send original payload + Ctrl-Z
+                 * immediately so EC200U exits data mode before the reconnect
+                 * block sends AT+QMTCLOSE / AT+CFUN=1,1 (otherwise those
+                 * commands are swallowed as payload and never execute).     */
+                HAL_UART_Transmit(modem_uart,
+                                  (uint8_t *)pub_payload, pub_len_in_flight, 3000);
+                uint8_t ctrlz = 0x1A;
+                HAL_UART_Transmit(modem_uart, &ctrlz, 1, 1000);
+                pub_len_in_flight = 0;
             }
             rxpos = 0;
             continue;
@@ -2998,6 +3036,7 @@ void Modem_Process(void)
         snprintf(pub_cmd, sizeof(pub_cmd),
                  "AT+QMTPUBEX=0,0,0,0,\"%s\",%d",  /* QoS=0: msgID must be 0 */
                  pub_topic, (int)strlen(pub_payload));
+        pub_len_in_flight = strlen(pub_payload); /* record N for data-mode escape */
         modem_cmd(pub_cmd);
         mqtt_state = MQTT_STATE_PUBLISHING;
         state_entered_ms = HAL_GetTick();
@@ -3014,8 +3053,24 @@ void Modem_Process(void)
             /* Refresh IWDG immediately — blink_n(5/6/7) may have consumed up to
              * 3800ms before setting DISCONNECTED, leaving < 200ms until timeout. */
             HAL_IWDG_Refresh(&hiwdg);
+            pub_len_in_flight = 0; /* abandon in-flight publish; '>' no longer expected */
             qmtopen_tls_seen = false;
             disconnected_count++;
+
+            /* ── Escape any pending AT+QMTPUBEX data mode ──────────────────
+             * Race: if +QMTSTAT: arrived before the '>' prompt was processed,
+             * mqtt_state flipped to DISCONNECTED without ever sending the
+             * payload/Ctrl-Z.  EC200U sent '>' and is still waiting for N
+             * payload bytes; every AT command we send is consumed as payload
+             * data and eventually published as garbage to the broker.
+             * Ctrl-Z (0x1A) exits data mode in all EC200U modes:
+             *   • in data mode  → commits a zero/partial publish (connection
+             *     is dead anyway) and exits to command mode
+             *   • in command mode → harmless noise / ignored                */
+            { uint8_t esc = 0x1A; HAL_UART_Transmit(modem_uart, &esc, 1, 100); }
+            HAL_Delay(200);
+            modem_flush_detect_cmti(200);
+            HAL_IWDG_Refresh(&hiwdg);
 
             /* ── Nuclear option: CFUN hard reset on persistent failure ── *
              * After an OTA reboot: fire after 1 failure (TLS heap may still    *
@@ -3102,13 +3157,22 @@ void Modem_Process(void)
     }
 
     /* ── net registration timeout — retry both GPRS and LTE ── */
+    /* This block runs every Modem_Process iteration (not just on line receipt)
+     * so the 3-min timeout fires even when the modem sends no responses.    */
     if (mqtt_state == MQTT_STATE_NET_WAIT &&
         HAL_GetTick() - state_entered_ms > 5000)
     {
         state_entered_ms = HAL_GetTick();
-        modem_cmd("AT+CGREG?");
-        HAL_Delay(200);
-        modem_cmd("AT+CEREG?");
+        net_wait_tries++;
+        if (net_wait_tries > 36) {
+            net_wait_tries = 0;
+            Debug_Print("[NET] NET_WAIT timeout (3 min) — forcing reconnect\r\n");
+            mqtt_state = MQTT_STATE_DISCONNECTED;
+        } else {
+            modem_cmd("AT+CGREG?");
+            HAL_Delay(200);
+            modem_cmd("AT+CEREG?");
+        }
     }
 }
 
