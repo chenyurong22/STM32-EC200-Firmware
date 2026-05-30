@@ -207,6 +207,11 @@ static uint32_t ota_retry_block_until = 0;
  * the SSL/MQTT config phase — these must not trigger a spurious modem_reinit. */
 static uint32_t modem_init_grace_until = 0;
 
+/* Consecutive MQTT reconnect failures — reset to 0 on successful connect.
+ * Used to trigger a CFUN hard-reset after 5 consecutive BROKER_OPEN/CONN
+ * failures so a stuck TLS state cannot keep the device offline forever.  */
+static int disconnected_count = 0;
+
 /* set false when PDP_OPEN is entered; set true when AT+QICSGP is sent from
  * Modem_Process (after the RX buffer is drained) so we never mistake the
  * trailing OK of AT+CGREG? for QICSGP's OK.                                */
@@ -280,6 +285,30 @@ void Modem_Send(const char *cmd)
     if (!modem_uart || !cmd)
         return;
     HAL_UART_Transmit(modem_uart, (const uint8_t *)cmd, strlen(cmd), 2000);
+}
+
+/* Read one byte from the modem UART with a per-byte timeout.
+ * Uses direct register access (matches Modem_Process fast-path) so the
+ * HAL lock is not involved and overrun errors are cleared on every call.
+ * Returns 0 on success (*c filled), -1 on timeout or invalid args.
+ * Used as the OTA_RecvFn callback for APP RDY detection in OTA_ST_REBOOT. */
+int Modem_Receive(uint8_t *c, uint32_t timeout_ms)
+{
+    if (!modem_uart || !c) return -1;
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < timeout_ms) {
+        IWDG->KR = 0xAAAAU;
+        uint32_t isr = modem_uart->Instance->ISR;
+        if (isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE)) {
+            modem_uart->Instance->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF;
+            modem_uart->ErrorCode = HAL_UART_ERROR_NONE;
+        }
+        if (isr & USART_ISR_RXNE_RXFNE) {
+            *c = (uint8_t)(modem_uart->Instance->RDR & 0xFF);
+            return 0;
+        }
+    }
+    return -1; /* timeout */
 }
 
 static void modem_cmd(const char *cmd)
@@ -1965,6 +1994,7 @@ static void process_line(const char *line)
         {
             /* lora_ota topic subscribed — fully connected now */
             Debug_Print("[MQTT] Subscribed to " TOPIC_LORA_OTA "\r\n");
+            disconnected_count = 0; /* clear failure counter on successful connect */
             blink_n(3); /* 3 blinks = MQTT fully connected! */
             HAL_IWDG_Refresh(&hiwdg);
 
@@ -2647,6 +2677,7 @@ void Modem_Init(UART_HandleTypeDef *huart)
      * and publish MQTT status without a circular header dependency.         */
     OTA_Init();
     OTA_SetSendFn(Modem_Send);
+    OTA_SetRecvFn(Modem_Receive);  /* for APP RDY detection in OTA_ST_REBOOT */
     OTA_SetPublishFn(modem_ota_publish);
 
     /* Wire up LoRa OTA callbacks (pump03 Blue Pill firmware update over LoRa) */
@@ -2975,6 +3006,27 @@ void Modem_Process(void)
              * 3800ms before setting DISCONNECTED, leaving < 200ms until timeout. */
             HAL_IWDG_Refresh(&hiwdg);
             qmtopen_tls_seen = false;
+            disconnected_count++;
+
+            /* ── Nuclear option: 5+ consecutive failures → CFUN hard reset ── *
+             * After ~4 min stuck in DISCONNECTED the most likely cause is a     *
+             * residual TLS heap or SSL context issue that survive normal         *
+             * QMTCLOSE/QIDEACT cleanup.  AT+CFUN=1,1 is the only reliable fix. */
+            if (disconnected_count > 5)
+            {
+                disconnected_count = 0;
+                Debug_Print("[MQTT] DISCONNECTED x5 — CFUN hard reset\r\n");
+                modem_cmd("AT+CFUN=1,1");
+                if (!modem_sync_expect("APP RDY", 60000))
+                    Debug_Print("[MQTT] CFUN APP RDY timeout\r\n");
+                for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+                modem_flush_detect_cmti(100);
+                IWDG->KR = 0xAAAAU;
+                modem_reinit_pending = true;
+                mqtt_state = MQTT_STATE_BOOT;
+                return; /* Modem_Process will call Modem_Init on next call */
+            }
+
             Debug_Print("[MQTT] Reconnecting...\r\n");
             /* Stop any active HTTP session BEFORE closing MQTT and deactivating
              * the PDP bearer.  After a failed OTA, the HTTP context may still be
@@ -2990,17 +3042,20 @@ void Modem_Process(void)
             HAL_IWDG_Refresh(&hiwdg);
             /* Flush URCs from QMTCLOSE; detect +CMTI so SMS is not lost. */
             modem_flush_detect_cmti(1);
-            /* Re-apply after QMTCLOSE — QMTCLOSE reloads NVM which resets version
-             * to default=3 (MQTT 3.1) which strips credentials from CONNECT.  */
-            modem_cmd("AT+QMTCFG=\"version\",0,4");  /* keep MQTT 3.1.1        */
+            /* Re-apply full MQTT config after QMTCLOSE — QMTCLOSE reloads NVM
+             * which resets version (3.1 → strips credentials), ssl (disabled),
+             * pdpcid, session, and recv/mode to factory defaults.             */
+            modem_cmd("AT+QMTCFG=\"version\",0,4");    /* MQTT 3.1.1           */
             HAL_Delay(300);
             modem_cmd("AT+QMTCFG=\"will\",0,0");
             HAL_Delay(300);
-            /* QMTCLOSE reloads NVM which resets ssl to factory default (0=disabled).
-             * Without this, QMTOPEN uses plain TCP on port 8883 (TLS expected) and
-             * fails silently every reconnect cycle — confirmed root cause of
-             * post-OTA MQTT never connecting.                                   */
-            modem_cmd("AT+QMTCFG=\"ssl\",0,1,0"); /* MQTT ctx 0 → SSL ctx 0    */
+            modem_cmd("AT+QMTCFG=\"ssl\",0,1,0");      /* MQTT ctx 0 → SSL 0   */
+            HAL_Delay(300);
+            modem_cmd("AT+QMTCFG=\"pdpcid\",0,1");     /* MQTT ctx 0 → PDP 1   */
+            HAL_Delay(300);
+            modem_cmd("AT+QMTCFG=\"session\",0,1");    /* clean session        */
+            HAL_Delay(300);
+            modem_cmd("AT+QMTCFG=\"recv/mode\",0,1,1"); /* push + full payload */
             HAL_Delay(300);
             HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QIDEACT=1");

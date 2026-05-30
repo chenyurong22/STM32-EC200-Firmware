@@ -13,6 +13,7 @@
 void  Modem_Init(UART_HandleTypeDef *huart);
 void  Modem_Process(void);              /* call every loop iteration        */
 void  Modem_Send(const char *cmd);      /* send raw AT command              */
+int   Modem_Receive(uint8_t *c, uint32_t timeout_ms); /* recv 1 byte (OTA callback) */
 bool  Modem_IsConnected(void);          /* true only when MQTT CONNECTED    */
 
 /* ── Network RTC ─────────────────────────────────────────────────────────── */

@@ -86,3 +86,9 @@ void OTA_SetSendFn(OTA_SendFn fn);
 /* Publish function pointer — set by modem.c so OTA can push status via MQTT */
 typedef void (*OTA_PublishFn)(const char *topic, const char *payload);
 void OTA_SetPublishFn(OTA_PublishFn fn);
+
+/* Receive function pointer — set by modem.c so OTA can poll UART during
+ * blocking waits (e.g. detecting "APP RDY" after AT+CFUN=1,1).
+ * Returns 0 on success (one byte stored in *c), -1 on timeout / error.  */
+typedef int (*OTA_RecvFn)(uint8_t *c, uint32_t timeout_ms);
+void OTA_SetRecvFn(OTA_RecvFn fn);
