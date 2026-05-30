@@ -704,6 +704,12 @@ static void run_protection(void)
             if (relay1) {
                 /* Relay was manually restarted — cancel auto-restart */
                 uv_pl_tripped1 = false; uv_cleared_ms1 = 0;
+            } else if (relay2) {
+                /* relay2 was turned ON while relay1 was tripped — cancel
+                 * auto-restart to maintain mutual exclusion (only one pump
+                 * can run at a time).                                      */
+                uv_pl_tripped1 = false; uv_cleared_ms1 = 0;
+                Debug_Print("[PROT] UV auto-restart cancelled — pump2 active\r\n");
             } else if (cfg_uv_restart_t > 0) {
                 if (uv_cleared_ms1 == 0) {
                     uv_cleared_ms1 = HAL_GetTick();
@@ -712,7 +718,9 @@ static void run_protection(void)
                            HAL_GetTick() - uv_cleared_ms1 >= (uint32_t)cfg_uv_restart_t * 1000U) {
                     uv_pl_tripped1 = false; uv_cleared_ms1 = 0;
                     Relay1_Set(true);
+                    relay1_on_tick = HAL_GetTick();
                     log_relay_event(1, true, "uv_restart");
+                    publish_status();
                     Debug_Print("[PROT] UV/PL auto-restart — pump1 ON\r\n");
                 }
             } else {
@@ -724,6 +732,11 @@ static void run_protection(void)
         if (uv_pl_tripped2) {
             if (relay2) {
                 uv_pl_tripped2 = false; uv_cleared_ms2 = 0;
+            } else if (relay1) {
+                /* relay1 was turned ON while relay2 was tripped — cancel
+                 * auto-restart to maintain mutual exclusion.              */
+                uv_pl_tripped2 = false; uv_cleared_ms2 = 0;
+                Debug_Print("[PROT] UV auto-restart cancelled — pump1 active\r\n");
             } else if (cfg_uv_restart_t > 0) {
                 if (uv_cleared_ms2 == 0) {
                     uv_cleared_ms2 = HAL_GetTick();
@@ -732,7 +745,9 @@ static void run_protection(void)
                            HAL_GetTick() - uv_cleared_ms2 >= (uint32_t)cfg_uv_restart_t * 1000U) {
                     uv_pl_tripped2 = false; uv_cleared_ms2 = 0;
                     Relay2_Set(true);
+                    relay2_on_tick = HAL_GetTick();
                     log_relay_event(2, true, "uv_restart");
+                    publish_status();
                     Debug_Print("[PROT] UV/PL auto-restart — pump2 ON\r\n");
                 }
             } else {
@@ -2499,28 +2514,35 @@ void Modem_Init(UART_HandleTypeDef *huart)
          * modem software reset which clears all TLS heap.
          * OTA_IsActive() returns true during OTA_ST_REBOOT so the
          * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
-        /* Retry CFUN up to 2 times, waiting for "APP RDY" (the final EC200U
-         * boot URC) up to 60 s each attempt.  APP RDY confirms the modem's
-         * application layer is fully up and TLS heap is cleared.
-         * The old 30s RDY wait timed out when the modem took >30s to reset
-         * after a big HTTPS download.  APP RDY always comes AFTER RDY and
-         * CPIN — it is the definitive "modem ready" signal.                */
-        for (int attempt = 0; attempt < 2; attempt++) {
-            if (attempt > 0)
-                Debug_Print("[MODEM] CFUN: APP RDY not seen — retrying CFUN\r\n");
-            Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
-            modem_cmd("AT+CFUN=1,1");
-            if (modem_sync_expect("APP RDY", 60000)) {
-                Debug_Print("[MODEM] CFUN: APP RDY received — modem ready\r\n");
-                break;
+        bool cfun_predone = OTA_WasCFUNPreDone();
+        if (cfun_predone) {
+            /* CFUN was already sent in OTA_ST_REBOOT ~75 s ago; the modem
+             * has been up and re-registering on LTE throughout bootloader +
+             * MCU init.  Just drain stray URCs and continue.               */
+            Debug_Print("[MODEM] OTA reboot — CFUN pre-done, modem up already\r\n");
+            for (int i = 0; i < 6; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; } /* 3 s */
+            modem_flush_detect_cmti(100);
+            IWDG->KR = 0xAAAAU;
+        } else {
+            /* Fallback: sentinel not found (first OTA with new firmware, or
+             * unexpected reset).  Do CFUN now to clear TLS heap.           */
+            for (int attempt = 0; attempt < 2; attempt++) {
+                if (attempt > 0)
+                    Debug_Print("[MODEM] CFUN: APP RDY not seen — retrying CFUN\r\n");
+                Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
+                modem_cmd("AT+CFUN=1,1");
+                if (modem_sync_expect("APP RDY", 60000)) {
+                    Debug_Print("[MODEM] CFUN: APP RDY received — modem ready\r\n");
+                    break;
+                }
+                Debug_Print("[MODEM] CFUN: APP RDY timeout\r\n");
             }
-            Debug_Print("[MODEM] CFUN: APP RDY timeout\r\n");
+            /* 10 s settle after APP RDY: SIM CPIN + partial LTE registration */
+            for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+            modem_flush_detect_cmti(100); /* drain settle URCs; save +CMTI if any */
+            IWDG->KR = 0xAAAAU;
+            Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
         }
-        /* 10 s settle after APP RDY: SIM CPIN + partial LTE registration   */
-        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
-        modem_flush_detect_cmti(100); /* drain settle URCs; save +CMTI if any */
-        IWDG->KR = 0xAAAAU;
-        Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
     } else {
         /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }

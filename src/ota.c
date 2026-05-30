@@ -91,6 +91,13 @@ static OTA_PublishFn ota_publish_fn = NULL;
 #define OTA_REBOOT_SENTINEL 0xDEADBEEFUL
 static volatile uint32_t ota_reboot_sentinel __attribute__((section(".noinit")));
 
+/* Second sentinel: set AFTER AT+CFUN=1,1 completes in OTA_ST_REBOOT,
+ * meaning the modem has already been reset and LTE re-registration has
+ * been running for ~75 s before the STM32 reboots.  Modem_Init checks
+ * this to skip its own CFUN step and just settle briefly instead.      */
+#define OTA_CFUN_DONE_SENTINEL 0xCAFEBABEUL
+static volatile uint32_t ota_cfun_done_sentinel __attribute__((section(".noinit")));
+
 /* Prototypes */
 static void ota_stream_buf_reset(void);
 static bool ota_stream_buf_push(uint8_t b);
@@ -402,6 +409,17 @@ bool OTA_WasRebootPending(void)
     }
     return false;
 }
+/* Returns true (and clears sentinel) iff CFUN was pre-done in OTA_ST_REBOOT.
+ * Modem_Init uses this to skip its own CFUN reset after an OTA reboot.    */
+bool OTA_WasCFUNPreDone(void)
+{
+    if (ota_cfun_done_sentinel == OTA_CFUN_DONE_SENTINEL) {
+        ota_cfun_done_sentinel = 0;
+        return true;
+    }
+    return false;
+}
+
 bool OTA_BinaryPending(void) { return ota_stream_active; }
 bool OTA_ShouldYieldRx(void) { return ota_stream_active && ota_stream_buf_count >= OTA_STREAM_YIELD_THRESHOLD; }
 bool OTA_ExpectingHttpReadConnect(void)
@@ -831,7 +849,17 @@ void OTA_Process(void)
             ota_delay_wdg(3000);
             ota_send("AT+QIDEACT=1");
             ota_delay_wdg(5000);
-            ota_reboot_sentinel = OTA_REBOOT_SENTINEL;  /* mark intentional OTA reboot */
+            /* Reset the modem NOW so the TLS heap clears and LTE
+             * re-registration starts ~75 s before the STM32 reboots.
+             * By the time Modem_Init reaches NET_WAIT the modem has been
+             * up for >100 s and is typically already registered.
+             * Modem_Init detects ota_cfun_done_sentinel and skips its
+             * own CFUN step, saving another 60-120 s.                   */
+            Debug_Print("[OTA] Pre-reset CFUN — LTE re-reg starts now\r\n");
+            ota_send("AT+CFUN=1,1");
+            ota_delay_wdg(75000);   /* APP RDY arrives within 60 s; +15 s spare */
+            ota_cfun_done_sentinel = OTA_CFUN_DONE_SENTINEL;
+            ota_reboot_sentinel    = OTA_REBOOT_SENTINEL;
             NVIC_SystemReset();
         }
         break;
