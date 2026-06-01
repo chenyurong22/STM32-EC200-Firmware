@@ -28,7 +28,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#define FW_VER "2026-05-30g"
+#define FW_VER "2026-06-01a"
 const char g_fw_ver[] = FW_VER;
 extern volatile uint32_t g_reset_reason_magic;
 extern volatile uint32_t g_hf_pc;
@@ -397,21 +397,21 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief  Debug_Print — temporarily enabled for OTA diagnosis.
-  *         Transmitting on USART2 at 9600 baud.
+  * @brief  Debug_Print — OTA/modem diagnosis via USART3 (PB8=TX, 115200 baud).
+  *         Connect USB-serial RX → PB8, GND → GND, 115200 8N1.
   */
 #if !defined(FW_MIN_LOGS)
 void Debug_Print(const char *msg) {
   const uint8_t *p = (const uint8_t *)msg;
   while (*p) {
     uint32_t guard = 200000U;
-    while (((USART2->ISR & USART_ISR_TXE_TXFNF) == 0U) && guard--) {
+    while (((USART3->ISR & USART_ISR_TXE_TXFNF) == 0U) && guard--) {
       WDG_KICK();
     }
     if (guard == 0U) {
       return;
     }
-    USART2->TDR = *p++;
+    USART3->TDR = *p++;
     WDG_KICK();
   }
 }

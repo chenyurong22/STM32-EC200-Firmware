@@ -3074,7 +3074,7 @@ void Modem_Process(void)
              * be dirty from HTTPS download; CFUN is the only reliable fix).    *
              * Normal operation: fire after 5 failures (~4 min of retries).     *
              * AT+CFUN=1,1 is the only way to fully clear EC200U TLS heap.      */
-            int nuclear_threshold = ota_first_reconnect ? 1 : 5;
+            int nuclear_threshold = ota_first_reconnect ? 0 : 5;
             if (disconnected_count > nuclear_threshold)
             {
                 disconnected_count  = 0;
