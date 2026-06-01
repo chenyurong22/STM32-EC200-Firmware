@@ -67,6 +67,7 @@ static uint32_t ota_preerase_page_idx = 0;     /* page counter for non-blocking 
 
 static uint8_t  ota_httpget_retries = 0;
 static uint8_t  ota_httpread_retries = 0;
+static uint32_t ota_expected_crc32 = 0;   /* reference CRC set by bridge; 0 = no check */
 
 /* Buffers */
 static uint8_t  ota_bin_buf[OTA_CHUNK_SIZE];
@@ -374,6 +375,8 @@ static bool ota_flash_append(const uint8_t *buf, uint32_t len)
 }
 
 /* Public API */
+void OTA_SetExpectedCRC(uint32_t crc32) { ota_expected_crc32 = crc32; }
+
 void OTA_Init(void)
 {
     ota_state = OTA_ST_IDLE;
@@ -386,6 +389,7 @@ void OTA_Init(void)
     ota_preerase_page_idx = 0;
     ota_dw_len = 0;
     ota_dw_prog_off = 0;
+    ota_expected_crc32 = 0;
     ota_stream_buf_reset();
 }
 
@@ -787,6 +791,20 @@ void OTA_Process(void)
     case OTA_ST_FLAG_WRITE:
     {
         uint32_t final_crc = ota_crc32 ^ 0xFFFFFFFFUL;
+
+        /* Reference CRC check — bridge.js computes CRC32 of the binary at
+         * deploy time and embeds it in the MQTT OTA trigger message.
+         * If the stream was corrupted (e.g. UART byte drop) the CRC computed
+         * over the received bytes will differ from the original binary CRC,
+         * aborting the OTA safely before the flags page is written.          */
+        if (ota_expected_crc32 != 0 && final_crc != ota_expected_crc32) {
+            char emsg[56];
+            snprintf(emsg, sizeof(emsg), "crc_mismatch:%08lX!=%08lX",
+                     (unsigned long)final_crc,
+                     (unsigned long)ota_expected_crc32);
+            ota_error(emsg);
+            break;
+        }
 
         FLASH_EraseInitTypeDef er = {
             .TypeErase = FLASH_TYPEERASE_PAGES,

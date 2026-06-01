@@ -1007,7 +1007,7 @@ static bool extract_ota_url_any(const char *text, char *out, size_t max)
     return (i > 0);
 }
 
-static void modem_ota_start(const char *url); /* forward declaration */
+static void modem_ota_start(const char *url, uint32_t expected_crc32); /* forward declaration */
 static void modem_ota_publish(const char *topic, const char *payload); /* forward declaration */
 static void modem_lora_ota_publish(const char *topic, const char *payload); /* forward declaration */
 static bool modem_is_exact_reboot_urc(const char *line);
@@ -1478,7 +1478,7 @@ static void process_line(const char *line)
                     LoRaOta_Start(lora_url);
                 return;
             }
-            /* OTA command: {"url":"https://..."} */
+            /* OTA command: {"url":"https://...","crc32":"AABBCCDD"} */
             char ota_url[200];
             if (extract_str(json, "url", ota_url, sizeof(ota_url)))
             {
@@ -1486,7 +1486,11 @@ static void process_line(const char *line)
                     Debug_Print("[OTA] Ignored trigger (cooldown after reboot)\r\n");
                     return;
                 }
-                modem_ota_start(ota_url);
+                char crc_str[12] = {0};
+                uint32_t ref_crc = 0;
+                if (extract_str(json, "crc32", crc_str, sizeof(crc_str)))
+                    ref_crc = (uint32_t)strtoul(crc_str, NULL, 16);
+                modem_ota_start(ota_url, ref_crc);
                 return;
             }
             int r1 = extract_int(json, "relay1");
@@ -1532,7 +1536,7 @@ static void process_line(const char *line)
             if (extract_ota_url_any(line, ota_url, sizeof(ota_url)))
             {
                 recv_payload_pending = false;
-                modem_ota_start(ota_url);
+                modem_ota_start(ota_url, 0);
                 return;
             }
         }
@@ -1566,7 +1570,7 @@ static void process_line(const char *line)
                     LoRaOta_Start(lora_url);
                 return;
             }
-            /* OTA command: {"url":"https://..."} */
+            /* OTA command: {"url":"https://...","crc32":"AABBCCDD"} */
             char ota_url[200];
             if (extract_str(json, "url", ota_url, sizeof(ota_url)))
             {
@@ -1574,7 +1578,11 @@ static void process_line(const char *line)
                     Debug_Print("[OTA] Ignored trigger (cooldown after reboot)\r\n");
                     return;
                 }
-                modem_ota_start(ota_url);
+                char crc_str[12] = {0};
+                uint32_t ref_crc = 0;
+                if (extract_str(json, "crc32", crc_str, sizeof(crc_str)))
+                    ref_crc = (uint32_t)strtoul(crc_str, NULL, 16);
+                modem_ota_start(ota_url, ref_crc);
                 return;
             }
             /* Inline payload — check if pump/02/cmd (relay1→physical relay2) */
@@ -1637,7 +1645,7 @@ static void process_line(const char *line)
             char ota_url[200];
             if (extract_ota_url_any(line, ota_url, sizeof(ota_url)))
             {
-                modem_ota_start(ota_url);
+                modem_ota_start(ota_url, 0);
                 return;
             }
         }
@@ -2226,7 +2234,7 @@ static bool modem_extract_host(const char *url, char *host, size_t host_sz)
 }
 
 /* ── OTA trigger helper — re-applies HTTP config before each download ────── */
-static void modem_ota_start(const char *url)
+static void modem_ota_start(const char *url, uint32_t expected_crc32)
 {
     char ota_host[96] = {0};
     bool have_ota_host = modem_extract_host(url, ota_host, sizeof(ota_host));
@@ -2485,6 +2493,7 @@ static void modem_ota_start(const char *url)
     HAL_IWDG_Refresh(&hiwdg);
 
     /* URL + HTTP config are already set above; start directly from GET. */
+    OTA_SetExpectedCRC(expected_crc32);
     OTA_StartFromGet(url);
 }
 

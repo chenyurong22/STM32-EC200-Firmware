@@ -77,6 +77,13 @@ void  OTA_SetBinaryExpect(uint32_t n);
 bool  OTA_BinaryPending(void);
 void  OTA_FeedByte(uint8_t b);
 
+/* Set the reference CRC32 of the expected firmware image.  Call before
+ * OTA_Start / OTA_StartFromGet.  At FLAG_WRITE the streamed CRC32 is
+ * compared against this value; mismatch aborts the OTA and leaves Slot B
+ * untouched so the running firmware is never overwritten with garbage.
+ * Pass 0 to disable the check (backward compatible with old bridge). */
+void OTA_SetExpectedCRC(uint32_t crc32);
+
 /* Modem_Send pointer — set by OTA_Init() from modem.h so ota.c can send
  * AT commands without a circular header dependency.                        */
 typedef void (*OTA_SendFn)(const char *cmd);

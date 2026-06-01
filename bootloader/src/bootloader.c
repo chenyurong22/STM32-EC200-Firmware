@@ -13,7 +13,9 @@
  *        a. CRC32 check of App Slot B (flags.size bytes)
  *        b. If OK: erase App Slot A pages, copy Slot B → Slot A
  *        c. Erase OTA Flags page
- *   3. Set VTOR = 0x08002000, load MSP, jump to Reset_Handler in Slot A
+ *   3. jump_to_app() — checks MSP + Reset_Handler sanity
+ *   4. Slot B fallback — if Slot A invalid, copy Slot B directly
+ *   5. If all slots invalid — start IWDG and spin (~4s reset loop)
  */
 
 #include "stm32g0xx_hal.h"
@@ -105,18 +107,35 @@ static bool flash_copy_slot(uint32_t size)
     return true;
 }
 
+/* ── Validate Slot A vector table (MSP in RAM + Reset_Handler in Slot A) ── */
+static bool slot_valid(uint32_t base)
+{
+    const uint32_t *vt = (const uint32_t *)base;
+    /* MSP must point into RAM */
+    if ((vt[0] & 0xFF000000UL) != 0x20000000UL) return false;
+    /* Reset_Handler must be inside this slot (Thumb bit set → odd address) */
+    uint32_t pc = vt[1] & ~1UL;
+    if (pc < base || pc >= base + OTA_SLOT_SIZE)   return false;
+    return true;
+}
+
+/* ── Check Slot B has plausible firmware (MSP only) ──────────────────────
+ * The app is compiled for Slot A (Reset_Handler at 0x08002xxx), so we
+ * cannot check the PC range against Slot B.  MSP in RAM is sufficient to
+ * distinguish written firmware from erased flash (0xFFFFFFFF).           */
+static bool slot_b_has_firmware(void)
+{
+    const uint32_t msp = *(const uint32_t *)APP_SLOT_B_ADDR;
+    return ((msp & 0xFF000000UL) == 0x20000000UL);
+}
+
 /* ── Jump to application at Slot A ── */
 static void jump_to_app(void)
 {
-    /* Slot A vector table: word[0] = initial MSP, word[1] = Reset_Handler */
+    if (!slot_valid(APP_SLOT_A_ADDR)) return;
+
     const uint32_t *vt = (const uint32_t *)APP_SLOT_A_ADDR;
 
-    /* Sanity check: MSP must point somewhere in RAM */
-    if ((vt[0] & 0xFF000000UL) != 0x20000000UL)
-        return; /* Slot A is empty / erased — do not jump */
-
-    /* Disable all interrupts, clear pending
-     * STM32G0 Cortex-M0+ has 32 IRQs — only index [0] is valid */
     __disable_irq();
     NVIC->ICER[0] = 0xFFFFFFFFUL;
     NVIC->ICPR[0] = 0xFFFFFFFFUL;
@@ -125,14 +144,10 @@ static void jump_to_app(void)
     __DSB();
     __ISB();
 
-    /* Set MSP and jump */
     __set_MSP(vt[0]);
-
-    /* Cast vector table entry to a function pointer and call it */
     void (*app_reset)(void) = (void (*)(void))(vt[1]);
     app_reset();
 
-    /* Should never reach here */
     while (1) {}
 }
 
@@ -143,7 +158,7 @@ int main(void)
 {
     HAL_Init();
 
-    /* Read OTA flags */
+    /* ── Step 1: OTA flags path ── */
     const OTA_Flags_t *flags = (const OTA_Flags_t *)OTA_FLAGS_ADDR;
 
     if (flags->magic == OTA_MAGIC &&
@@ -173,11 +188,27 @@ int main(void)
         flash_erase_pages(OTA_FLAGS_PAGE, OTA_FLAGS_PAGES);
     }
 
-    /* Jump to App Slot A */
+    /* ── Step 2: try Slot A ── */
     jump_to_app();
 
-    /* If Slot A is empty, spin (should not happen in normal use) */
-    while (1) {}
+    /* ── Step 3: Slot B fallback — Slot A invalid, try Slot B directly ──
+     * Covers the case where power was lost during Slot A erase/copy but
+     * Slot B still has valid firmware from the completed OTA download.  */
+    if (slot_b_has_firmware())
+    {
+        if (flash_erase_pages(APP_SLOT_A_PAGE, APP_SLOT_A_PAGES))
+            flash_copy_slot(OTA_SLOT_SIZE);
+        jump_to_app();
+    }
+
+    /* ── Step 4: both slots invalid — start IWDG and reset in ~4s ──
+     * Keeps retrying on every reset so a new OTA can recover the device. */
+    IWDG->KR  = 0xCCCCU;   /* start IWDG */
+    IWDG->KR  = 0x5555U;   /* unlock PR/RLR */
+    IWDG->PR  = 3U;         /* prescaler /32 → ~1 kHz tick from LSI */
+    IWDG->RLR = 4000U;      /* ~4 s timeout */
+    IWDG->KR  = 0xAAAAU;    /* reload */
+    while (1) {}            /* IWDG fires → reset → retry */
 }
 
 /* ── Minimal HAL time-base (SysTick not strictly needed by bootloader) ── */
