@@ -2574,35 +2574,16 @@ void Modem_Init(UART_HandleTypeDef *huart)
             ota_error_msg[sizeof(ota_error_msg) - 1] = '\0';
             Debug_Print("[OTA] Post-OTA: bootloader CRC fail — old firmware kept\r\n");
         }
-        /* AT+QHTTPSTOP does NOT fully free the TLS context-1 heap on the
-         * EC200U after an HTTPS OTA download.  Without clearing it,
-         * AT+QMTOPEN cannot allocate SSL buffers for MQTT context 0 and
-         * MQTT never reconnects after OTA (confirmed: QMTOPEN? returns
-         * just "OK" — no active session).  AT+CFUN=1,1 performs a full
-         * modem software reset which clears all TLS heap.
-         * OTA_IsActive() returns true during OTA_ST_REBOOT so the
-         * DISCONNECTED auto-reconnect block cannot fire during cleanup.  */
-        /* AT+CFUN=1,1 clears the EC200U TLS heap left over from the HTTPS
-         * OTA download.  Without this, AT+QMTOPEN silently fails because
-         * TLS context-1 heap is still allocated from the HTTPS session.
-         * This single CFUN in Modem_Init is the proven-reliable place —
-         * OTA_ST_REBOOT no longer issues CFUN (double-CFUN was fragile). */
-        Debug_Print("[MODEM] OTA reboot — AT+CFUN=1,1 to clear TLS heap\r\n");
-        for (int attempt = 0; attempt < 2; attempt++) {
-            if (attempt > 0)
-                Debug_Print("[MODEM] CFUN: APP RDY not seen — retrying CFUN\r\n");
-            modem_cmd("AT+CFUN=1,1");
-            if (modem_sync_expect("APP RDY", 60000)) {
-                Debug_Print("[MODEM] CFUN: APP RDY received — modem ready\r\n");
-                break;
-            }
-            Debug_Print("[MODEM] CFUN: APP RDY timeout\r\n");
-        }
-        /* 10 s settle after APP RDY: SIM CPIN + partial LTE registration */
-        for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
-        modem_flush_detect_cmti(100); /* drain settle URCs; save +CMTI if any */
-        IWDG->KR = 0xAAAAU;
-        Debug_Print("[MODEM] CFUN reset + settle complete\r\n");
+        /* No CFUN here — nuclear CFUN in DISCONNECTED (threshold=0) fires on
+         * the first MQTT failure and is the proven-reliable place to clear
+         * the EC200U TLS heap.  Doing CFUN in Modem_Init caused 2×60s waits
+         * on APP RDY timeout and still didn't prevent BROKER_OPEN failure.
+         * With ota_first_reconnect=true and nuclear_threshold=0, the nuclear
+         * CFUN fires immediately on the first DISCONNECTED and calls
+         * Modem_Init again with a clean modem. */
+        Debug_Print("[MODEM] OTA reboot — skipping CFUN, nuclear will clear TLS on first failure\r\n");
+        /* 5 s settle: same as cold boot, enough for AT commands */
+        for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
     } else {
         /* Cold boot — EC200U powers on and takes ~5 s before it accepts AT. */
         for (int i = 0; i < 10; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
