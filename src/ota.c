@@ -703,9 +703,12 @@ void OTA_HandleLine(const char *line)
 /* Process */
 void OTA_Process(void)
 {
-    while (ota_stream_buf_count > 0)
+    /* One doubleword (8 bytes) per call — limits flash write stall to ~93 µs
+     * (one UART byte period at 115200 baud) so Modem_Process() can drain
+     * the UART RDR on the next main-loop iteration without ORE overrun.    */
+    if (ota_stream_buf_count > 0)
     {
-        uint32_t n = ota_stream_buf_pop_chunk(ota_bin_buf, OTA_CHUNK_SIZE);
+        uint32_t n = ota_stream_buf_pop_chunk(ota_bin_buf, 8U);
         if (n > 0 && !ota_flash_append(ota_bin_buf, n)) {
             ota_error("flash write failed");
             return;
