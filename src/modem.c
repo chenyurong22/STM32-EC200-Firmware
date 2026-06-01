@@ -2534,6 +2534,15 @@ static void modem_lora_ota_publish(const char *topic, const char *payload)
 void Modem_Init(UART_HandleTypeDef *huart)
 {
     modem_uart = huart;
+
+    /* Enable the STM32G0 8-byte RX FIFO so bytes received during a flash
+     * write stall (86–200 µs) are buffered instead of triggering ORE.
+     * With FIFO disabled only 1 byte fits in RDR; at 115200 baud the next
+     * byte arrives ~87 µs later, causing silent data corruption during OTA.
+     * Threshold = 1/8 (1 byte) keeps RXNE behaviour identical to no-FIFO. */
+    HAL_UARTEx_EnableFifoMode(modem_uart);
+    HAL_UARTEx_SetRxFifoThreshold(modem_uart, UART_RXFIFO_THRESHOLD_1_8);
+
     rxpos = 0;
     mqtt_state = MQTT_STATE_BOOT;
     state_entered_ms = HAL_GetTick();
