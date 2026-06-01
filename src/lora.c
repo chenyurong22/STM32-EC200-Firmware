@@ -114,8 +114,10 @@ static void lora_process_rcv(const char *line)
     lora_last_rcv_tick = HAL_GetTick();
 
     char dbg[80];
-    snprintf(dbg, sizeof(dbg), "[LoRa] slave: %.63s\r\n", data);
-    Debug_Print(dbg);
+    if (!OTA_IsActive()) {
+        snprintf(dbg, sizeof(dbg), "[LoRa] slave: %.63s\r\n", data);
+        Debug_Print(dbg);
+    }
 
     /* Route OTA protocol responses to lora_ota state machine */
     if (strncmp(data, "OTA:", 4) == 0) {
@@ -132,9 +134,11 @@ static void lora_process_rcv(const char *line)
         if (r2)
             lora_relay4_state = (strncmp(r2 + 3, "ON", 2) == 0) ? 1 : 0;
 
-        snprintf(dbg, sizeof(dbg), "[LoRa] HB relay3=%d relay4=%d\r\n",
-                 lora_relay3_state, lora_relay4_state);
-        Debug_Print(dbg);
+        if (!OTA_IsActive()) {
+            snprintf(dbg, sizeof(dbg), "[LoRa] HB relay3=%d relay4=%d\r\n",
+                     lora_relay3_state, lora_relay4_state);
+            Debug_Print(dbg);
+        }
         return;
     }
 
