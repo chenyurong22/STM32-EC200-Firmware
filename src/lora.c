@@ -14,6 +14,7 @@
 
 #include "lora.h"
 #include "lora_ota.h"
+#include "ota.h"
 #include "main.h"
 #include <string.h>
 #include <stdio.h>
@@ -218,9 +219,16 @@ void LoRa_Process(void)
             lora_line[lora_pos] = '\0';
             if (lora_pos > 0)
             {
-                char dbg[LORA_LINE_MAX + 16];
-                snprintf(dbg, sizeof(dbg), "[LoRa] RX: %s\r\n", lora_line);
-                Debug_Print(dbg);
+                /* Suppress debug print during OTA binary stream — Debug_Print
+                 * blocks ~87µs/char on USART3; a 50-char LoRa line stalls the
+                 * main loop ~4ms, overflowing the 8-byte modem UART FIFO and
+                 * losing stream bytes → CRC mismatch.  Relay commands still
+                 * execute; only the serial log line is skipped.              */
+                if (!OTA_IsActive()) {
+                    char dbg[LORA_LINE_MAX + 16];
+                    snprintf(dbg, sizeof(dbg), "[LoRa] RX: %s\r\n", lora_line);
+                    Debug_Print(dbg);
+                }
 
                 if (strncmp(lora_line, "+RCV=", 5) == 0)
                     lora_process_rcv(lora_line);
