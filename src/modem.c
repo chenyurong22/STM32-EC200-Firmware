@@ -2608,6 +2608,12 @@ void Modem_Init(UART_HandleTypeDef *huart)
     }
     if (!modem_sync_cmd_ok("AT", 2000, 15))
         Debug_Print("[MODEM] WARN: AT sync failed, continuing\r\n");
+    /* Restore factory defaults so any stale NVRAM settings (e.g. a bad
+     * AT+CNMI value written during previous abnormal operation) do not
+     * persist across power cycles.  All required settings are re-applied
+     * explicitly below, so AT&F here is safe.  Must run before ATE0 so
+     * echo is disabled again after the factory reset re-enables it.      */
+    modem_sync_cmd_ok("AT&F", 2000, 3);
     if (!modem_sync_cmd_ok("ATE0", 2000, 5))
         Debug_Print("[MODEM] WARN: ATE0 failed, continuing\r\n");
     /* Lock CEREG URC mode to 0 so AT+CEREG? always returns "+CEREG: 0,<stat>".
@@ -2618,12 +2624,9 @@ void Modem_Init(UART_HandleTypeDef *huart)
         Debug_Print("[MODEM] WARN: CEREG mode set failed, continuing\r\n");
 
     /* SMS text mode, +CMTI URC on new message, clear stored messages */
-    modem_cmd("AT+CMGF=1");          /* select text mode                   */
-    HAL_Delay(300);
-    modem_cmd("AT+CNMI=2,1,0,0,0"); /* route new-SMS URC (+CMTI) to UART  */
-    HAL_Delay(300);
-    modem_cmd("AT+CMGD=1,4");       /* delete ALL stored messages (clean slate) */
-    HAL_Delay(300);
+    modem_sync_cmd_ok("AT+CMGF=1", 2000, 3);
+    modem_sync_cmd_ok("AT+CNMI=2,1,0,0,0", 2000, 3);
+    modem_sync_cmd_ok("AT+CMGD=1,4", 3000, 3);
     IWDG->KR = 0xAAAAU;
 
     /* SSL context 1 — used by HTTP client for HTTPS OTA downloads.
