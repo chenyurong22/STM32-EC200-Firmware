@@ -2870,6 +2870,7 @@ void Modem_Process(void)
         recv_payload_pending   = false;
         pub_pending            = false;
         pub_status2_needed     = false;
+        mqtt_offline_since_ms  = 0; /* fresh 5-min window after each reinit */
         OTA_Init();
         Modem_Init(modem_uart);
         return;
