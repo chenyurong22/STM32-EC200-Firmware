@@ -199,6 +199,7 @@ static bool pub_status2_needed = false;
 /* event-driven publish: track previous state to detect changes */
 static uint32_t last_heartbeat_ms  = 0;
 static uint32_t lora_log_last_ms   = 0;
+static uint32_t mqtt_offline_since_ms = 0; /* HAL_GetTick() when MQTT left active state; 0=active */
 static bool     prev_relay1        = false;
 static bool     prev_relay2        = false;
 static bool     prev_dry_run_trip  = false;
@@ -2623,6 +2624,11 @@ void Modem_Init(UART_HandleTypeDef *huart)
     if (!modem_sync_cmd_ok("AT+CEREG=0", 2000, 5))
         Debug_Print("[MODEM] WARN: CEREG mode set failed, continuing\r\n");
 
+    /* Route all URCs to UART1 (the MCU interface).  EC200U NVRAM can store
+     * "usbmodem" here if USB was ever connected during factory test, which
+     * silently redirects +CMTI (and all other URCs) away from the MCU.    */
+    modem_sync_cmd_ok("AT+QURCCFG=\"urcport\",\"uart1\"", 2000, 3);
+
     /* SMS text mode, +CMTI URC on new message, clear stored messages */
     modem_sync_cmd_ok("AT+CMGF=1", 2000, 3);
     modem_sync_cmd_ok("AT+CNMI=2,1,0,0,0", 2000, 3);
@@ -3171,6 +3177,33 @@ void Modem_Process(void)
             modem_cmd("AT+CGREG?");
             HAL_Delay(200);
             modem_cmd("AT+CEREG?");
+        }
+    }
+
+    /* ── 5-minute MQTT offline watchdog: full STM32 reset ────────────────────
+     * If MQTT has not been in an active (connected/publishing) state for 5
+     * continuous minutes, perform NVIC_SystemReset().  This catches stuck
+     * states that the nuclear CFUN path alone cannot recover from (e.g. modem
+     * wedged during NET_WAIT or PDP_OPEN with no URCs arriving).
+     * Suppressed during OTA downloads so an in-progress update is not aborted. */
+    if (!OTA_IsActive() && !LoRaOta_IsActive())
+    {
+        bool mqtt_active = (mqtt_state == MQTT_STATE_CONNECTED  ||
+                            mqtt_state == MQTT_STATE_PUBLISHING ||
+                            mqtt_state == MQTT_STATE_PUB_WAIT_OK);
+        if (mqtt_active)
+        {
+            mqtt_offline_since_ms = 0;
+        }
+        else if (mqtt_offline_since_ms == 0)
+        {
+            mqtt_offline_since_ms = HAL_GetTick();
+        }
+        else if (HAL_GetTick() - mqtt_offline_since_ms > 300000UL)
+        {
+            Debug_Print("[MQTT] 5-min offline watchdog — STM32 reset\r\n");
+            IWDG->KR = 0xAAAAU;
+            NVIC_SystemReset();
         }
     }
 }
