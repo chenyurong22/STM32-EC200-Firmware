@@ -2190,6 +2190,59 @@ static void modem_flush_detect_cmti(uint32_t byte_timeout_ms)
     rxpos = 0; /* discard any partial line in the main line buffer */
 }
 
+/* Active delay: keeps draining the UART FIFO and detecting +CMTI for the
+ * full duration.  Replaces raw HAL_Delay() in all blocking AT command
+ * sequences so the 8-byte hardware FIFO never overflows and SMS arrival
+ * notifications (+CMTI) are never lost during MQTT reconnect windows.   */
+static void modem_wait(uint32_t ms)
+{
+    uint32_t deadline = HAL_GetTick() + ms;
+    while ((int32_t)(deadline - HAL_GetTick()) > 0)
+        modem_flush_detect_cmti(1);
+}
+
+/* Poll modem for any unread SMS (AT+CMGL="REC UNREAD").
+ * Called periodically as a safety net when MQTT is connected and idle,
+ * catching any +CMTI that was missed during earlier blocking waits.     */
+static void sms_poll_unread(void)
+{
+    { uint8_t _c; while (HAL_UART_Receive(modem_uart, &_c, 1, 1) == HAL_OK) {} }
+    rxpos = 0;
+    modem_cmd("AT+CMGL=\"REC UNREAD\"");
+
+    char lb[80]; int lp = 0;
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < 5000)
+    {
+        IWDG->KR = 0xAAAAU;
+        uint8_t b;
+        if (HAL_UART_Receive(modem_uart, &b, 1, 100) != HAL_OK) continue;
+        if (b == '\r') continue;
+        if (b == '\n')
+        {
+            lb[lp] = '\0';
+            if (lp > 0)
+            {
+                if (strstr(lb, "+CMGL:"))
+                {
+                    /* +CMGL: <idx>,"REC UNREAD",... — extract index */
+                    const char *p = lb + 6;
+                    while (*p == ' ') p++;
+                    int idx = atoi(p);
+                    if (idx > 0 && !sms_pending)
+                    { sms_index = idx; sms_pending = true; }
+                }
+                else if (strcmp(lb, "OK") == 0 || strcmp(lb, "ERROR") == 0)
+                    break;
+            }
+            lp = 0;
+        }
+        else if (lp < (int)sizeof(lb) - 1)
+            lb[lp++] = (char)b;
+    }
+    rxpos = 0;
+}
+
 /* Send an AT command and wait for an OK response.
  * Retries are used in Modem_Init because EC200U can still be settling
  * for a short time after CFUN reset during post-OTA reboot. */
@@ -2629,10 +2682,13 @@ void Modem_Init(UART_HandleTypeDef *huart)
      * silently redirects +CMTI (and all other URCs) away from the MCU.    */
     modem_sync_cmd_ok("AT+QURCCFG=\"urcport\",\"uart1\"", 2000, 3);
 
-    /* SMS text mode, +CMTI URC on new message, clear stored messages */
+    /* SMS text mode, +CMTI URC on new message.
+     * Delete only already-read messages (flag=1); flag=4 would wipe unread
+     * SMS that arrived during the CFUN reboot window before sms_process()
+     * could read them.  sms_process() deletes each message after reading.  */
     modem_sync_cmd_ok("AT+CMGF=1", 2000, 3);
     modem_sync_cmd_ok("AT+CNMI=2,1,0,0,0", 2000, 3);
-    modem_sync_cmd_ok("AT+CMGD=1,4", 3000, 3);
+    modem_sync_cmd_ok("AT+CMGD=1,1", 3000, 3);  /* 1=read only, not unread */
     IWDG->KR = 0xAAAAU;
 
     /* SSL context 1 — used by HTTP client for HTTPS OTA downloads.
@@ -2880,6 +2936,22 @@ void Modem_Process(void)
     if (!OTA_IsActive())
         sms_process();
 
+    /* ── Periodic SMS poll: safety net for +CMTI missed during blocking waits ──
+     * modem_wait() in the reconnect path covers the offline case; this poll
+     * covers any remaining edge cases when MQTT is connected and modem is idle.
+     * Only runs when fully connected (no pending AT commands) to avoid
+     * corrupting in-flight MQTT responses with an unexpected AT+CMGL.         */
+    if (!OTA_IsActive() && !LoRaOta_IsActive() && !sms_pending &&
+        mqtt_state == MQTT_STATE_CONNECTED)
+    {
+        static uint32_t sms_poll_last_ms = 0;
+        if (HAL_GetTick() - sms_poll_last_ms > 30000UL)
+        {
+            sms_poll_last_ms = HAL_GetTick();
+            sms_poll_unread();
+        }
+    }
+
     /* ── send AT+QIACT=1 after buffer is drained (avoids stale QMTCLOSE/QIDEACT OK) ── */
     if (mqtt_state == MQTT_STATE_PDP_ACTIVATE && !qiact_sent)
     {
@@ -3074,7 +3146,7 @@ void Modem_Process(void)
              *     is dead anyway) and exits to command mode
              *   • in command mode → harmless noise / ignored                */
             { uint8_t esc = 0x1A; HAL_UART_Transmit(modem_uart, &esc, 1, 100); }
-            HAL_Delay(200);
+            modem_wait(200);
             modem_flush_detect_cmti(200);
             HAL_IWDG_Refresh(&hiwdg);
 
@@ -3092,7 +3164,7 @@ void Modem_Process(void)
                 modem_cmd("AT+CFUN=1,1");
                 if (!modem_sync_expect("APP RDY", 60000))
                     Debug_Print("[MQTT] CFUN APP RDY timeout\r\n");
-                for (int i = 0; i < 20; i++) { HAL_Delay(500); IWDG->KR = 0xAAAAU; }
+                modem_wait(10000); /* 10 s settle — keeps FIFO drained, detects +CMTI */
                 modem_flush_detect_cmti(100);
                 IWDG->KR = 0xAAAAU;
                 modem_reinit_pending = true;
@@ -3108,10 +3180,10 @@ void Modem_Process(void)
              * state and preventing MQTT from ever reconnecting.
              * Modem_Init already does this; we must mirror it here.            */
             modem_cmd("AT+QHTTPSTOP");
-            HAL_Delay(500);
+            modem_wait(500);
             HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QMTCLOSE=0");
-            HAL_Delay(1500);
+            modem_wait(1500);
             HAL_IWDG_Refresh(&hiwdg);
             /* Flush URCs from QMTCLOSE; detect +CMTI so SMS is not lost. */
             modem_flush_detect_cmti(1);
@@ -3119,20 +3191,20 @@ void Modem_Process(void)
              * which resets version (3.1 → strips credentials), ssl (disabled),
              * pdpcid, session, and recv/mode to factory defaults.             */
             modem_cmd("AT+QMTCFG=\"version\",0,4");    /* MQTT 3.1.1           */
-            HAL_Delay(300);
+            modem_wait(300);
             modem_cmd("AT+QMTCFG=\"will\",0,0");
-            HAL_Delay(300);
+            modem_wait(300);
             modem_cmd("AT+QMTCFG=\"ssl\",0,1,0");      /* MQTT ctx 0 → SSL 0   */
-            HAL_Delay(300);
+            modem_wait(300);
             modem_cmd("AT+QMTCFG=\"pdpcid\",0,1");     /* MQTT ctx 0 → PDP 1   */
-            HAL_Delay(300);
+            modem_wait(300);
             modem_cmd("AT+QMTCFG=\"session\",0,1");    /* clean session        */
-            HAL_Delay(300);
+            modem_wait(300);
             modem_cmd("AT+QMTCFG=\"recv/mode\",0,1,1"); /* push + full payload */
-            HAL_Delay(300);
+            modem_wait(300);
             HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QIDEACT=1");
-            HAL_Delay(1500);
+            modem_wait(1500);
             HAL_IWDG_Refresh(&hiwdg);
             /* Flush URCs from QIDEACT; detect +CMTI so SMS is not lost. */
             modem_flush_detect_cmti(1);
@@ -3142,16 +3214,16 @@ void Modem_Process(void)
              * reset seclevel/ciphersuite/SNI back to factory defaults,
              * causing TLS handshake to fail when QMTOPEN is sent.          */
             modem_cmd("AT+QSSLCFG=\"sslversion\",0,4");
-            HAL_Delay(300);
+            modem_wait(300);
             HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QSSLCFG=\"ciphersuite\",0,0xFFFF");
-            HAL_Delay(300);
+            modem_wait(300);
             HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QSSLCFG=\"seclevel\",0,0");
-            HAL_Delay(300);
+            modem_wait(300);
             HAL_IWDG_Refresh(&hiwdg);
             modem_cmd("AT+QSSLCFG=\"sni\",0,\"" BROKER_HOST "\"");
-            HAL_Delay(300);
+            modem_wait(300);
             HAL_IWDG_Refresh(&hiwdg);
             /* APN already configured — skip QICSGP, go straight to QIACT.
              * Modem_Process sends AT+QIACT=1 after the buffer is drained
