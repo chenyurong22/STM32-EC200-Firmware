@@ -1202,13 +1202,14 @@ class _SettingsPageState extends State<SettingsPage> {
   // Global notification toggle (stored in SharedPreferences)
   bool _notifEnabled = true;
 
+  StreamSubscription<DatabaseEvent>? _settingsSub;
   StreamSubscription<DatabaseEvent>? _devSub;
 
   @override
   void initState() {
     super.initState();
     _pumpId = widget.pumpIds.isNotEmpty ? widget.pumpIds.first : 'pump01';
-    _load();
+    _listenSettings();
     _listenDeviceSettings();
     _loadNotifPref();
   }
@@ -1236,6 +1237,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    _settingsSub?.cancel();
     _devSub?.cancel();
     _ovCtrl.dispose(); _uvCtrl.dispose(); _plCtrl.dispose();
     _dryICtrl.dispose(); _dryTCtrl.dispose();
@@ -1263,25 +1265,28 @@ class _SettingsPageState extends State<SettingsPage> {
   // Live cfg values always come from the physical device's status.
   String get _statusPath   => 'pumps/$_deviceId/status';
 
-  Future<void> _load() async {
+  void _listenSettings() {
+    _settingsSub?.cancel();
     setState(() => _loading = true);
-    final snap = await db.ref(_settingsPath).get();
-    final s = snap.value as Map?;
-    setState(() {
-      _selectedHp    = (s?['hp']     as num?)?.toInt();
-      // null dry_en → default true; 0 → false
-      _dryRunEnabled = (s?['dry_en'] as num?)?.toInt() != 0;
-      _ovCtrl.text   = (s?['ov']    ?? 480).toString();
-      _uvCtrl.text   = (s?['uv']    ?? 360).toString();
-      _plCtrl.text   = (s?['pl']    ?? 200).toString();
-      // Fall back to defaults if value is missing or was previously zeroed
-      final rawDryI = (s?['dry_i'] as num?)?.toDouble() ?? 0.0;
-      _dryICtrl.text   = (rawDryI > 0 ? rawDryI : 1.5).toString();
-      final rawDryT = (s?['dry_t'] as num?)?.toInt() ?? 0;
-      _dryTCtrl.text   = (rawDryT > 0 ? rawDryT : 8).toString();
-      _startTCtrl.text = (s?['start_t'] ?? 300).toString();
-      _uvRstCtrl.text  = (s?['uv_rst']  ?? 300).toString();
-      _loading = false;
+    _settingsSub = db.ref(_settingsPath).onValue.listen((event) {
+      if (_saving || !mounted) return;
+      final s = event.snapshot.value as Map?;
+      setState(() {
+        _selectedHp    = (s?['hp']     as num?)?.toInt();
+        // null dry_en → default true; 0 → false
+        _dryRunEnabled = (s?['dry_en'] as num?)?.toInt() != 0;
+        _ovCtrl.text   = (s?['ov']    ?? 480).toString();
+        _uvCtrl.text   = (s?['uv']    ?? 360).toString();
+        _plCtrl.text   = (s?['pl']    ?? 200).toString();
+        // Fall back to defaults if value is missing or was previously zeroed
+        final rawDryI = (s?['dry_i'] as num?)?.toDouble() ?? 0.0;
+        _dryICtrl.text   = (rawDryI > 0 ? rawDryI : 1.5).toString();
+        final rawDryT = (s?['dry_t'] as num?)?.toInt() ?? 0;
+        _dryTCtrl.text   = (rawDryT > 0 ? rawDryT : 8).toString();
+        _startTCtrl.text = (s?['start_t'] ?? 300).toString();
+        _uvRstCtrl.text  = (s?['uv_rst']  ?? 300).toString();
+        _loading = false;
+      });
     });
   }
 
@@ -1314,6 +1319,7 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   void _onPumpChanged(String pump) {
+    _settingsSub?.cancel();
     _devSub?.cancel();
     setState(() {
       _pumpId = pump;
@@ -1323,7 +1329,7 @@ class _SettingsPageState extends State<SettingsPage> {
       _devDryI2 = null;
       _devDryT2 = _devStartT2 = _devHp2 = _devDryEn2 = null;
     });
-    _load();
+    _listenSettings();
     _listenDeviceSettings();
   }
 

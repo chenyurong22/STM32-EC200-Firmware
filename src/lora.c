@@ -8,7 +8,7 @@
  *
  * Replies received from slave:
  *   P1:ON OK   P1:OFF OK   P2:ON OK   P2:OFF OK
- *   S:R1:ON|R2:OFF
+ *   S:R1:ON|R2:OFF|FL:12.5|TV:1250
  *   ERR:UNKNOWN CMD
  */
 
@@ -35,8 +35,12 @@ static char     lora_line[LORA_LINE_MAX];
 static uint16_t lora_pos = 0;
 
 /* slave relay states — updated whenever a heartbeat/ack arrives */
-static int lora_relay3_state = -1;  /* -1 = unknown, 0 = OFF, 1 = ON */
-static int lora_relay4_state = -1;
+static int   lora_relay3_state = -1;  /* -1 = unknown, 0 = OFF, 1 = ON */
+static int   lora_relay4_state = -1;
+
+/* slave flow meter — updated on heartbeat (integer, avoids soft-float) */
+static uint32_t lora_flow_lpm_x10    = 0; /* L/min × 10, e.g. 125 = 12.5 L/min */
+static uint32_t lora_total_litres_int = 0; /* total volume in whole litres        */
 
 /* last received +RCV signal quality */
 static int      lora_last_rssi     = 0;
@@ -134,9 +138,25 @@ static void lora_process_rcv(const char *line)
         if (r2)
             lora_relay4_state = (strncmp(r2 + 3, "ON", 2) == 0) ? 1 : 0;
 
+        /* Parse flow meter fields (optional — old slaves omit them)
+         * Format: FL:12.5  TV:1250  (no %f needed — integer parse) */
+        const char *fl = strstr(data, "FL:");
+        if (fl) {
+            const char *p2 = fl + 3;
+            long whole = strtol(p2, (char **)&p2, 10);
+            long frac  = 0;
+            if (*p2 == '.') frac = strtol(p2 + 1, NULL, 10) % 10;
+            lora_flow_lpm_x10 = (uint32_t)(whole * 10 + frac);
+        }
+        const char *tv = strstr(data, "TV:");
+        if (tv) lora_total_litres_int = (uint32_t)strtol(tv + 3, NULL, 10);
+
         if (!OTA_IsActive()) {
-            snprintf(dbg, sizeof(dbg), "[LoRa] HB relay3=%d relay4=%d\r\n",
-                     lora_relay3_state, lora_relay4_state);
+            snprintf(dbg, sizeof(dbg), "[LoRa] HB r3=%d r4=%d fl=%lu.%lu tv=%lu\r\n",
+                     lora_relay3_state, lora_relay4_state,
+                     (unsigned long)(lora_flow_lpm_x10 / 10),
+                     (unsigned long)(lora_flow_lpm_x10 % 10),
+                     (unsigned long)lora_total_litres_int);
             Debug_Print(dbg);
         }
         return;
@@ -255,10 +275,14 @@ void LoRa_SendRaw(const char *msg)
     lora_send_cmd(cmd);
 }
 
-int      LoRa_GetRelay3State(void)  { return lora_relay3_state; }
-int      LoRa_GetRelay4State(void)  { return lora_relay4_state; }
-int      LoRa_GetLastRSSI(void)     { return lora_last_rssi; }
-int      LoRa_GetLastSNR(void)      { return lora_last_snr; }
+int      LoRa_GetRelay3State(void)       { return lora_relay3_state; }
+int      LoRa_GetRelay4State(void)       { return lora_relay4_state; }
+int      LoRa_GetLastRSSI(void)          { return lora_last_rssi; }
+int      LoRa_GetLastSNR(void)           { return lora_last_snr; }
+/* Flow: returns L/min × 10 (e.g. 125 = 12.5 L/min) */
+uint32_t LoRa_GetFlowLpmX10(void)        { return lora_flow_lpm_x10; }
+/* Total litres (whole number, accumulated since last slave reboot) */
+uint32_t LoRa_GetTotalLitresInt(void)    { return lora_total_litres_int; }
 /* Returns ms since last +RCV, or 0xFFFFFFFF if never received */
 uint32_t LoRa_GetLastRcvAge(void)
 {

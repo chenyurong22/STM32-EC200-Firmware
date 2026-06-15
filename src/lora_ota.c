@@ -1,3 +1,6 @@
+#include "lora_ota.h"
+#ifndef LORA_OTA_DISABLED
+
 /* lora_ota.c — LoRa OTA relay for Blue Pill firmware update
  *
  * Flow:
@@ -19,8 +22,6 @@
  *   OTA:ACK:START   OTA:RESUME:<seq4>   OTA:ACK:<seq4>
  *   OTA:ERR:<seq4>:<reason>             OTA:DONE:OK / OTA:DONE:ERR
  */
-
-#include "lora_ota.h"
 #include "main.h"
 #include "modem.h"
 #include <string.h>
@@ -719,3 +720,5 @@ void LoRaOta_Process(void)
         break;
     }
 }
+
+#endif /* LORA_OTA_DISABLED */

@@ -3057,22 +3057,33 @@ void Modem_Process(void)
             uint32_t age_s = LoRa_GetLastRcvAge();
             if (age_s == 0xFFFFFFFFUL) age_s = 0;
             else                        age_s /= 1000;
-            char lora_log[128];
+            /* fl_x10: L/min × 10 (e.g. 125 = 12.5 L/min) — integer to avoid %f */
+            uint32_t fl_x10 = LoRa_GetFlowLpmX10();
+            uint32_t tv_l   = LoRa_GetTotalLitresInt();
+            char lora_log[160];
             if (ts)
                 snprintf(lora_log, sizeof(lora_log),
                          "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
-                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,\"ts\":%llu}",
+                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,"
+                         "\"fl\":%lu.%lu,\"tv\":%lu,\"ts\":%llu}",
                          LoRa_GetRelay3State(), LoRa_GetRelay4State(),
                          LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
                          (unsigned long)age_s,
+                         (unsigned long)(fl_x10 / 10U),
+                         (unsigned long)(fl_x10 % 10U),
+                         (unsigned long)tv_l,
                          (unsigned long long)ts);
             else
                 snprintf(lora_log, sizeof(lora_log),
                          "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
-                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu}",
+                         "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,"
+                         "\"fl\":%lu.%lu,\"tv\":%lu}",
                          LoRa_GetRelay3State(), LoRa_GetRelay4State(),
                          LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
-                         (unsigned long)age_s);
+                         (unsigned long)age_s,
+                         (unsigned long)(fl_x10 / 10U),
+                         (unsigned long)(fl_x10 % 10U),
+                         (unsigned long)tv_l);
             queue_publish(TOPIC_SLAVE_LOG, lora_log);
         }
 
@@ -3253,8 +3264,8 @@ void Modem_Process(void)
         }
     }
 
-    /* ── 5-minute MQTT offline watchdog: full STM32 reset ────────────────────
-     * If MQTT has not been in an active (connected/publishing) state for 5
+    /* ── 2-minute MQTT offline watchdog: full STM32 reset ────────────────────
+     * If MQTT has not been in an active (connected/publishing) state for 2
      * continuous minutes, perform NVIC_SystemReset().  This catches stuck
      * states that the nuclear CFUN path alone cannot recover from (e.g. modem
      * wedged during NET_WAIT or PDP_OPEN with no URCs arriving).
@@ -3272,9 +3283,9 @@ void Modem_Process(void)
         {
             mqtt_offline_since_ms = HAL_GetTick();
         }
-        else if (HAL_GetTick() - mqtt_offline_since_ms > 300000UL)
+        else if (HAL_GetTick() - mqtt_offline_since_ms > 120000UL)
         {
-            Debug_Print("[MQTT] 5-min offline watchdog — STM32 reset\r\n");
+            Debug_Print("[MQTT] 2-min offline watchdog — STM32 reset\r\n");
             IWDG->KR = 0xAAAAU;
             NVIC_SystemReset();
         }
