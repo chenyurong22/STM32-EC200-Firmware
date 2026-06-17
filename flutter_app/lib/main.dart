@@ -46,6 +46,7 @@ class SiteConfig {
   final String meterPumpId; // pump whose status feeds PowerMeterCard
   final String deviceId;    // physical STM32 device that owns relay1+relay2 for this site
   final List<String> pumpIds; // index 0 → relay1, index 1 → relay2 on deviceId
+  final bool hasSlave;      // true if a Blue Pill LoRa slave is attached (flow meter)
 
   const SiteConfig({
     required this.id,
@@ -53,6 +54,7 @@ class SiteConfig {
     required this.meterPumpId,
     required this.deviceId,
     required this.pumpIds,
+    this.hasSlave = false,
   });
 }
 
@@ -70,6 +72,7 @@ const kSites = [
     meterPumpId: 'pump03',
     deviceId: 'pump03',        // future separate device
     pumpIds: ['pump03', 'pump04'],
+    hasSlave: true,            // Blue Pill slave with YF-DN50 flow meter
   ),
 ];
 
@@ -296,6 +299,10 @@ class _SiteSection extends StatelessWidget {
           pump1Id: site.pumpIds[0],
           pump2Id: site.pumpIds[1],
         ),
+        if (site.hasSlave) ...[
+          const SizedBox(height: 16),
+          FlowMeterCard(deviceId: site.deviceId),
+        ],
       ],
     );
   }
@@ -1075,6 +1082,157 @@ class _PowerMeterCardState extends State<PowerMeterCard> {
           ],
         ),
       ),
+    );
+  }
+}
+
+// ─── Flow Meter Card ──────────────────────────────────────────────────────────
+class FlowMeterCard extends StatefulWidget {
+  final String deviceId;
+  const FlowMeterCard({super.key, required this.deviceId});
+  @override
+  State<FlowMeterCard> createState() => _FlowMeterCardState();
+}
+
+class _FlowMeterCardState extends State<FlowMeterCard> {
+  final db = FirebaseDatabase.instance;
+  Map<String, dynamic> _log = {};
+  StreamSubscription<DatabaseEvent>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _sub = db
+        .ref('pumps/${widget.deviceId}/slave_log')
+        .limitToLast(1)
+        .onChildAdded
+        .listen((event) {
+      final data = event.snapshot.value;
+      if (data != null && mounted) {
+        setState(() => _log = Map<String, dynamic>.from(data as Map));
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_log.isEmpty) {
+      return Card(
+        elevation: 2,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: const Padding(
+          padding: EdgeInsets.all(16),
+          child: Row(children: [
+            Icon(Icons.water_drop, color: Colors.blueGrey),
+            SizedBox(width: 8),
+            Text('Flow Meter',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            Spacer(),
+            Text('No data', style: TextStyle(color: Colors.grey)),
+          ]),
+        ),
+      );
+    }
+
+    final int fl      = ((_log['fl']       ?? 0) as num).toInt();
+    final int tv      = ((_log['tv']       ?? 0) as num).toInt();
+    final int tvTotal = ((_log['tv_total'] ?? 0) as num).toInt();
+    final int rssi    = ((_log['rssi']     ?? 0) as num).toInt();
+    final int ageS    = ((_log['age_s']    ?? 0) as num).toInt();
+    final bool flowing = fl > 0;
+    final bool stale   = ageS > 120;
+    final Color rssiColor = rssi < -95 ? Colors.red
+                          : rssi < -85 ? Colors.orange
+                          : Colors.green;
+
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Icon(Icons.water_drop,
+                  color: flowing ? Colors.blue : Colors.blueGrey),
+              const SizedBox(width: 8),
+              const Text('Flow Meter',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              const Spacer(),
+              Icon(Icons.router, color: rssiColor, size: 16),
+              const SizedBox(width: 4),
+              Text('$rssi dBm',
+                  style: TextStyle(fontSize: 11, color: rssiColor)),
+              const SizedBox(width: 10),
+              Icon(stale ? Icons.warning_amber : Icons.check_circle,
+                  color: stale ? Colors.orange : Colors.green, size: 14),
+              const SizedBox(width: 4),
+              Text('${ageS}s ago',
+                  style: TextStyle(
+                      fontSize: 11,
+                      color: stale ? Colors.orange : Colors.grey)),
+            ]),
+            const Divider(),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _FlowChip(
+                    label: 'Flow Rate',
+                    value: '$fl L/min',
+                    icon: Icons.speed,
+                    color: flowing ? Colors.blue : Colors.grey),
+                _FlowChip(
+                    label: 'Session',
+                    value: '$tv L',
+                    icon: Icons.water,
+                    color: Colors.teal),
+                _FlowChip(
+                    label: 'Total',
+                    value: '$tvTotal L',
+                    icon: Icons.storage,
+                    color: Colors.indigo),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _FlowChip extends StatelessWidget {
+  final String label;
+  final String value;
+  final IconData icon;
+  final Color color;
+  const _FlowChip(
+      {required this.label,
+      required this.value,
+      required this.icon,
+      required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Icon(icon, color: color, size: 22),
+        const SizedBox(height: 4),
+        Text(value,
+            style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.bold,
+                color: color)),
+        Text(label,
+            style: const TextStyle(fontSize: 11, color: Colors.grey)),
+      ],
     );
   }
 }

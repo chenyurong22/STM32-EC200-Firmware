@@ -39,7 +39,8 @@ int      LoRa_GetLastSNR(void);
 
 /* Flow meter values from slave heartbeat (integer — avoids soft-float) */
 uint32_t LoRa_GetFlowLpmX10(void);     /* L/min × 10, e.g. 125 = 12.5 L/min */
-uint32_t LoRa_GetTotalLitresInt(void); /* cumulative whole litres from slave  */
+uint32_t LoRa_GetTotalLitresInt(void); /* tv from last heartbeat (resets on slave reboot) */
+uint32_t LoRa_GetTvCumulative(void);   /* true cumulative litres — survives slave reboots */
 
 /* Returns ms since last +RCV, or 0xFFFFFFFF if never received */
 uint32_t LoRa_GetLastRcvAge(void);

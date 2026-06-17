@@ -200,6 +200,58 @@ static bool pub_status2_needed = false;
 static uint32_t last_heartbeat_ms  = 0;
 static uint32_t lora_log_last_ms   = 0;
 static uint32_t mqtt_offline_since_ms = 0; /* HAL_GetTick() when MQTT left active state; 0=active */
+
+/* ── MQTT offline backoff watchdog ───────────────────────────────────────────
+ * Max 3 auto-resets with increasing delays:
+ *   reset #1 — 2 minutes offline
+ *   reset #2 — 30 minutes offline (on this boot)
+ *   reset #3 — 1 hour offline (on this boot)
+ * After 3 resets the board waits for manual power cycle.
+ * The reset count is stored in RTC BKP0R so it survives NVIC_SystemReset().
+ * It is cleared on any non-software reset (power-on, IWDG, pin reset).    */
+#define MQTT_WD_MAX_RESETS   3U
+static const uint32_t MQTT_WD_DELAY_MS[MQTT_WD_MAX_RESETS] = {
+    2UL  * 60UL * 1000UL,   /* reset #1: 2 min  */
+    30UL * 60UL * 1000UL,   /* reset #2: 30 min */
+    60UL * 60UL * 1000UL,   /* reset #3: 1 hour */
+};
+/* Persist reset count across NVIC_SystemReset() using a .noinit RAM variable.
+ * The startup code does NOT zero .noinit, so it survives a soft reset.
+ * A magic pair validates the contents — cleared by power-on (RAM loses state). */
+#define BKUP_MAGIC_A  0xDEADBEEFUL
+#define BKUP_MAGIC_B  0xCAFEBABEUL
+
+static uint32_t noinit_magic_a __attribute__((section(".noinit")));
+static uint32_t noinit_magic_b __attribute__((section(".noinit")));
+static uint8_t  noinit_reset_n __attribute__((section(".noinit")));
+
+/* Relay state saved when MQTT goes offline so it can be restored on reconnect.
+ * Stored in .noinit so it survives NVIC_SystemReset() between retry boots.  */
+#define OFFLINE_RELAY_MAGIC  0x4F46464CUL   /* "OFFL" */
+static uint32_t noinit_offline_magic  __attribute__((section(".noinit")));
+static uint8_t  noinit_offline_relay1 __attribute__((section(".noinit")));
+static uint8_t  noinit_offline_relay2 __attribute__((section(".noinit")));
+
+static uint8_t mqtt_reset_count = 0; /* initialised from noinit RAM in Modem_Init */
+
+static uint8_t bkup_get_reset_count(void)
+{
+    if (noinit_magic_a == BKUP_MAGIC_A && noinit_magic_b == BKUP_MAGIC_B)
+        return noinit_reset_n;
+    return 0U;
+}
+static void bkup_set_reset_count(uint8_t n)
+{
+    noinit_magic_a = BKUP_MAGIC_A;
+    noinit_magic_b = BKUP_MAGIC_B;
+    noinit_reset_n = n;
+}
+static void bkup_clear_reset_count(void)
+{
+    noinit_magic_a = 0U;
+    noinit_magic_b = 0U;
+    noinit_reset_n = 0U;
+}
 static bool     prev_relay1        = false;
 static bool     prev_relay2        = false;
 static bool     prev_dry_run_trip  = false;
@@ -2623,6 +2675,20 @@ void Modem_Init(UART_HandleTypeDef *huart)
     modem_log_reset_flags(reset_csr);
     RCC->CSR |= RCC_CSR_RMVF;   /* clear reset-cause flags for next check */
 
+    /* MQTT backoff counter — noinit RAM survives NVIC_SystemReset() but not
+     * power-off (RAM loses state).  On any non-software reset the magic pair
+     * will be invalid so bkup_get_reset_count() returns 0 automatically.
+     * Explicitly clear on non-software reset for reliability.              */
+    if (!(reset_csr & RCC_CSR_SFTRSTF))
+        bkup_clear_reset_count();
+    mqtt_reset_count = bkup_get_reset_count();
+    {
+        char dbg[48];
+        snprintf(dbg, sizeof(dbg), "[MQTT] backoff reset count: %u/%u\r\n",
+                 (unsigned)mqtt_reset_count, (unsigned)MQTT_WD_MAX_RESETS);
+        Debug_Print(dbg);
+    }
+
     if (ota_reboot) {
         /* Signal DISCONNECTED reconnect to fire nuclear CFUN after 1 failure
          * instead of 5 — makes MQTT reconnect in ~2-4 min rather than ~10. */
@@ -2937,18 +3003,25 @@ void Modem_Process(void)
         sms_process();
 
     /* ── Periodic SMS poll: safety net for +CMTI missed during blocking waits ──
-     * modem_wait() in the reconnect path covers the offline case; this poll
-     * covers any remaining edge cases when MQTT is connected and modem is idle.
-     * Only runs when fully connected (no pending AT commands) to avoid
-     * corrupting in-flight MQTT responses with an unexpected AT+CMGL.         */
-    if (!OTA_IsActive() && !LoRaOta_IsActive() && !sms_pending &&
-        mqtt_state == MQTT_STATE_CONNECTED)
+     * Runs every 30 s when MQTT is connected (normal operation).
+     * Also runs every 2 min when MQTT has been offline long enough that all
+     * 3 auto-resets are exhausted — the board is idle so no AT command
+     * conflicts.  This ensures SMS relay commands still work in the field
+     * even when LTE data is down.                                            */
+    if (!OTA_IsActive() && !LoRaOta_IsActive() && !sms_pending)
     {
-        static uint32_t sms_poll_last_ms = 0;
-        if (HAL_GetTick() - sms_poll_last_ms > 30000UL)
+        bool mqtt_connected = (mqtt_state == MQTT_STATE_CONNECTED);
+        bool mqtt_gave_up   = (mqtt_reset_count >= MQTT_WD_MAX_RESETS &&
+                               mqtt_state == MQTT_STATE_DISCONNECTED);
+        if (mqtt_connected || mqtt_gave_up)
         {
-            sms_poll_last_ms = HAL_GetTick();
-            sms_poll_unread();
+            static uint32_t sms_poll_last_ms = 0;
+            uint32_t interval = mqtt_connected ? 30000UL : 120000UL;
+            if (HAL_GetTick() - sms_poll_last_ms > interval)
+            {
+                sms_poll_last_ms = HAL_GetTick();
+                sms_poll_unread();
+            }
         }
     }
 
@@ -3058,32 +3131,35 @@ void Modem_Process(void)
             if (age_s == 0xFFFFFFFFUL) age_s = 0;
             else                        age_s /= 1000;
             /* fl_x10: L/min × 10 (e.g. 125 = 12.5 L/min) — integer to avoid %f */
-            uint32_t fl_x10 = LoRa_GetFlowLpmX10();
-            uint32_t tv_l   = LoRa_GetTotalLitresInt();
-            char lora_log[160];
+            uint32_t fl_x10  = LoRa_GetFlowLpmX10();
+            uint32_t tv_l    = LoRa_GetTotalLitresInt();
+            uint32_t tv_tot  = LoRa_GetTvCumulative();
+            char lora_log[192];
             if (ts)
                 snprintf(lora_log, sizeof(lora_log),
                          "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
                          "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,"
-                         "\"fl\":%lu.%lu,\"tv\":%lu,\"ts\":%llu}",
+                         "\"fl\":%lu.%lu,\"tv\":%lu,\"tv_total\":%lu,\"ts\":%llu}",
                          LoRa_GetRelay3State(), LoRa_GetRelay4State(),
                          LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
                          (unsigned long)age_s,
                          (unsigned long)(fl_x10 / 10U),
                          (unsigned long)(fl_x10 % 10U),
                          (unsigned long)tv_l,
+                         (unsigned long)tv_tot,
                          (unsigned long long)ts);
             else
                 snprintf(lora_log, sizeof(lora_log),
                          "{\"event\":\"lora_hb\",\"r3\":%d,\"r4\":%d,"
                          "\"rssi\":%d,\"snr\":%d,\"age_s\":%lu,"
-                         "\"fl\":%lu.%lu,\"tv\":%lu}",
+                         "\"fl\":%lu.%lu,\"tv\":%lu,\"tv_total\":%lu}",
                          LoRa_GetRelay3State(), LoRa_GetRelay4State(),
                          LoRa_GetLastRSSI(), LoRa_GetLastSNR(),
                          (unsigned long)age_s,
                          (unsigned long)(fl_x10 / 10U),
                          (unsigned long)(fl_x10 % 10U),
-                         (unsigned long)tv_l);
+                         (unsigned long)tv_l,
+                         (unsigned long)tv_tot);
             queue_publish(TOPIC_SLAVE_LOG, lora_log);
         }
 
@@ -3264,12 +3340,13 @@ void Modem_Process(void)
         }
     }
 
-    /* ── 2-minute MQTT offline watchdog: full STM32 reset ────────────────────
-     * If MQTT has not been in an active (connected/publishing) state for 2
-     * continuous minutes, perform NVIC_SystemReset().  This catches stuck
-     * states that the nuclear CFUN path alone cannot recover from (e.g. modem
-     * wedged during NET_WAIT or PDP_OPEN with no URCs arriving).
-     * Suppressed during OTA downloads so an in-progress update is not aborted. */
+    /* ── MQTT offline backoff watchdog ────────────────────────────────────────
+     * Reset #1: after 2 min offline (this boot)
+     * Reset #2: after 30 min offline (next boot)
+     * Reset #3: after 1 hour offline (next boot)
+     * After 3 resets: give up — wait for manual power cycle.
+     * Reset count survives NVIC_SystemReset() via RTC BKP0R.
+     * Suppressed during OTA so an in-progress download is not aborted.    */
     if (!OTA_IsActive() && !LoRaOta_IsActive())
     {
         bool mqtt_active = (mqtt_state == MQTT_STATE_CONNECTED  ||
@@ -3278,17 +3355,86 @@ void Modem_Process(void)
         if (mqtt_active)
         {
             mqtt_offline_since_ms = 0;
+            if (mqtt_reset_count > 0)
+            {
+                bkup_clear_reset_count();
+                mqtt_reset_count = 0;
+            }
         }
         else if (mqtt_offline_since_ms == 0)
         {
             mqtt_offline_since_ms = HAL_GetTick();
         }
-        else if (HAL_GetTick() - mqtt_offline_since_ms > 120000UL)
+        else if (mqtt_reset_count < MQTT_WD_MAX_RESETS)
         {
-            Debug_Print("[MQTT] 2-min offline watchdog — STM32 reset\r\n");
-            IWDG->KR = 0xAAAAU;
-            NVIC_SystemReset();
+            if (HAL_GetTick() - mqtt_offline_since_ms >
+                MQTT_WD_DELAY_MS[mqtt_reset_count])
+            {
+                char msg[64];
+                snprintf(msg, sizeof(msg),
+                         "[MQTT] offline watchdog reset #%u/%u\r\n",
+                         (unsigned)(mqtt_reset_count + 1U),
+                         (unsigned)MQTT_WD_MAX_RESETS);
+                Debug_Print(msg);
+                bkup_set_reset_count(mqtt_reset_count + 1U);
+                IWDG->KR = 0xAAAAU;
+                NVIC_SystemReset();
+            }
         }
+        else
+        {
+            static bool gave_up_logged = false;
+            if (!gave_up_logged)
+            {
+                Debug_Print("[MQTT] 3 resets exhausted — manual power cycle required\r\n");
+                gave_up_logged = true;
+            }
+        }
+    }
+
+    /* ── MQTT offline relay management ────────────────────────────────────────
+     * When MQTT goes offline: save relay states, turn both OFF, write OFF to
+     * Flash so reboots also start with relays off.
+     * When MQTT comes back online: restore saved relay states from .noinit RAM
+     * and write restored state to Flash.                                     */
+    {
+        bool mqtt_active = (mqtt_state == MQTT_STATE_CONNECTED  ||
+                            mqtt_state == MQTT_STATE_PUBLISHING ||
+                            mqtt_state == MQTT_STATE_PUB_WAIT_OK);
+        static bool mqtt_prev_active = false;
+
+        if (!mqtt_prev_active && mqtt_active)
+        {
+            /* MQTT just reconnected — restore saved relay state */
+            bool offline_valid = (noinit_offline_magic  == OFFLINE_RELAY_MAGIC) &&
+                                 (noinit_offline_relay1 <= 1U) &&
+                                 (noinit_offline_relay2 <= 1U);
+            if (offline_valid)
+            {
+                bool r1 = (noinit_offline_relay1 != 0U);
+                bool r2 = (noinit_offline_relay2 != 0U);
+                noinit_offline_magic = 0U;          /* clear saved state     */
+                Debug_Print("[MQTT] online — restoring relay states\r\n");
+                if (r1) { Relay1_Set(true);  relay1_on_tick = HAL_GetTick(); }
+                if (r2) { Relay2_Set(true);  relay2_on_tick = HAL_GetTick(); }
+                RelayState_Save();                  /* update Flash          */
+            }
+        }
+        else if (mqtt_prev_active && !mqtt_active)
+        {
+            /* MQTT just went offline — save relay states and turn both OFF  */
+            noinit_offline_relay1 = relay1 ? 1U : 0U;
+            noinit_offline_relay2 = relay2 ? 1U : 0U;
+            noinit_offline_magic  = OFFLINE_RELAY_MAGIC;
+            if (relay1 || relay2)
+            {
+                Debug_Print("[MQTT] offline — turning relays OFF\r\n");
+                Relay1_Set(false);
+                Relay2_Set(false);
+                RelayState_Save();   /* write OFF to Flash — survives reboot */
+            }
+        }
+        mqtt_prev_active = mqtt_active;
     }
 }
 

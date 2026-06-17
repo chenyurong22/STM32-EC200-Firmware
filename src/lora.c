@@ -40,7 +40,9 @@ static int   lora_relay4_state = -1;
 
 /* slave flow meter — updated on heartbeat (integer, avoids soft-float) */
 static uint32_t lora_flow_lpm_x10    = 0; /* L/min × 10, e.g. 125 = 12.5 L/min */
-static uint32_t lora_total_litres_int = 0; /* total volume in whole litres        */
+static uint32_t lora_total_litres_int = 0; /* tv from last heartbeat (resets on slave reboot) */
+static uint32_t lora_tv_prev         = 0; /* previous tv — reboot detection     */
+static uint32_t lora_tv_cumulative   = 0; /* true cumulative litres, never resets */
 
 /* last received +RCV signal quality */
 static int      lora_last_rssi     = 0;
@@ -149,14 +151,23 @@ static void lora_process_rcv(const char *line)
             lora_flow_lpm_x10 = (uint32_t)(whole * 10 + frac);
         }
         const char *tv = strstr(data, "TV:");
-        if (tv) lora_total_litres_int = (uint32_t)strtol(tv + 3, NULL, 10);
+        if (tv) {
+            uint32_t new_tv = (uint32_t)strtol(tv + 3, NULL, 10);
+            if (new_tv >= lora_tv_prev)
+                lora_tv_cumulative += new_tv - lora_tv_prev;   /* normal delta   */
+            else
+                lora_tv_cumulative += new_tv;                  /* slave rebooted */
+            lora_tv_prev          = new_tv;
+            lora_total_litres_int = new_tv;
+        }
 
         if (!OTA_IsActive()) {
-            snprintf(dbg, sizeof(dbg), "[LoRa] HB r3=%d r4=%d fl=%lu.%lu tv=%lu\r\n",
+            snprintf(dbg, sizeof(dbg), "[LoRa] HB r3=%d r4=%d fl=%lu.%lu tv=%lu tot=%lu\r\n",
                      lora_relay3_state, lora_relay4_state,
                      (unsigned long)(lora_flow_lpm_x10 / 10),
                      (unsigned long)(lora_flow_lpm_x10 % 10),
-                     (unsigned long)lora_total_litres_int);
+                     (unsigned long)lora_total_litres_int,
+                     (unsigned long)lora_tv_cumulative);
             Debug_Print(dbg);
         }
         return;
@@ -281,8 +292,10 @@ int      LoRa_GetLastRSSI(void)          { return lora_last_rssi; }
 int      LoRa_GetLastSNR(void)           { return lora_last_snr; }
 /* Flow: returns L/min × 10 (e.g. 125 = 12.5 L/min) */
 uint32_t LoRa_GetFlowLpmX10(void)        { return lora_flow_lpm_x10; }
-/* Total litres (whole number, accumulated since last slave reboot) */
+/* tv from last heartbeat — resets when slave reboots */
 uint32_t LoRa_GetTotalLitresInt(void)    { return lora_total_litres_int; }
+/* True cumulative litres — survives slave reboots (resets only on master reboot) */
+uint32_t LoRa_GetTvCumulative(void)      { return lora_tv_cumulative; }
 /* Returns ms since last +RCV, or 0xFFFFFFFF if never received */
 uint32_t LoRa_GetLastRcvAge(void)
 {
